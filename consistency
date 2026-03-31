@@ -1,0 +1,615 @@
+import os
+import json
+import torch
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+from datasets import load_dataset
+import pickle
+from torch.utils.data import Dataset, DataLoader
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM,
+    DataCollatorWithPadding, AutoConfig, RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,AutoModel
+)
+from peft import PeftModel, LoraConfig
+import transformers.utils.import_utils as import_utils
+import transformers.modeling_utils as modeling_utils
+import safetensors.torch
+
+original_check = import_utils.check_torch_load_is_safe
+original_load_check = modeling_utils.check_torch_load_is_safe
+import_utils.check_torch_load_is_safe = lambda: None
+modeling_utils.check_torch_load_is_safe = lambda: None
+
+class Model(torch.nn.Module):
+    def __init__(self, encoder, config, tokenizer, args):
+        super(Model, self).__init__()
+        self.encoder = encoder
+        self.config = config
+        self.tokenizer = tokenizer
+        self.args = args
+        self.dropout = torch.nn.Dropout(args.dropout_probability)
+
+    def forward(self, input_ids=None, labels=None):
+        attention_mask = input_ids.ne(1)
+        outputs = self.encoder(input_ids, attention_mask=attention_mask)[0]
+        outputs = self.dropout(outputs)
+        logits = outputs
+        prob = torch.sigmoid(logits)
+        
+        if labels is not None:
+            labels = labels.float()
+            loss = torch.log(prob[:, 0] + 1e-10) * labels + torch.log((1 - prob)[:, 0] + 1e-10) * (1 - labels)
+            loss = -loss.mean()
+            return loss, prob
+        else:
+            return prob
+
+class Config:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.seed = 42
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+
+        self.teacher_base_model_path = "autodl-tmp/codellma"
+        self.teacher_checkpoint_dir = "autodl-tmp/checkpoint-3600"
+        self.distilled_student_dir = "autodl-tmp/lamagra/best_model"
+        self.finetuned_student_dir = "autodl-tmp/graphcodebert_devign_finetune"
+        self.pkd_student_dir = "autodl-tmp/lamagraaa/best-pkd-student-model"
+        self.codebert_model_path = "autodl-tmp/graphcodebert"
+        self.num_labels = 2
+        self.dropout_probability = 0.1
+
+        self.dataset_name = "DetectVul/devign"
+        self.data_cache_dir = "studentd_dataset_cache"
+        self.max_length = 512
+        self.batch_size = 8
+        self.eval_batch_size = 16
+
+        self.EPS = 1e-6
+        self.vis_save_dir = "agreement_comparison_visualization4"
+        self.result_save_dir = "agreement_comparison_results4"
+        os.makedirs(self.vis_save_dir, exist_ok=True)
+        os.makedirs(self.result_save_dir, exist_ok=True)
+
+config = Config()
+
+class Qwen2CoderForVulnerabilityDetection(torch.nn.Module):
+    def __init__(self, base_model, num_labels=2, class_weights=None):
+        super().__init__()
+        self.base_model = base_model.to(config.device)
+        self.config = base_model.config
+        self.config.num_labels = num_labels
+        self.class_weights = class_weights.half() if class_weights is not None else None
+        self.hidden_size = self.config.hidden_size
+        self.classifier = torch.nn.Linear(self.hidden_size, num_labels).to(config.device, dtype=torch.float16)
+        self.dropout = torch.nn.Dropout(0.1).to(config.device)
+        torch.nn.init.normal_(self.classifier.weight, std=0.02)
+        if self.classifier.bias is not None:
+            torch.nn.init.zeros_(self.classifier.bias)
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        input_ids = input_ids.to(config.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(config.device)
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False
+        )
+        last_hidden_state = outputs.hidden_states[-1]
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).half()
+            pooled_output = torch.sum(last_hidden_state * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=config.EPS)
+        else:
+            pooled_output = torch.mean(last_hidden_state, dim=1)
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        return {"logits": logits}
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_model, name)
+
+class CodeBERT_DevignDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        return {
+            "input_ids": torch.tensor(sample["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(sample["attention_mask"], dtype=torch.long),
+            "labels": torch.tensor(sample["labels"], dtype=torch.long)
+        }
+
+def load_devign_data(dataset_name, cache_dir):
+    try:
+        if os.path.exists(os.path.join(cache_dir, "dataset_info.json")):
+            dataset = load_dataset(cache_dir=cache_dir)
+        else:
+            dataset = load_dataset(dataset_name)
+            dataset.save_to_disk(cache_dir)
+        return dataset
+    except Exception as e:
+        raise
+
+def preprocess_dataset_for_model(dataset, tokenizer, cache_dir, model_type):
+    cache_files = {
+        "test": os.path.join(cache_dir, f"{model_type}_tokenized_test.pkl")
+    }
+    if os.path.exists(cache_files["test"]):
+        with open(cache_files["test"], "rb") as f:
+            tokenized_test = pickle.load(f)
+    else:
+        def preprocess_func(examples):
+            code = examples["func_clean"]
+            tokenized = tokenizer(
+                code, truncation=True, max_length=config.max_length,
+                padding=False, return_tensors=None, add_special_tokens=True
+            )
+            labels = examples["target"]
+            if isinstance(labels[0], bool):
+                labels = [1 if label else 0 for label in labels]
+            tokenized["labels"] = labels
+            return tokenized
+        tokenized_test = dataset["test"].map(
+            preprocess_func, batched=True, remove_columns=dataset["test"].column_names
+        )
+        with open(cache_files["test"], "wb") as f:
+            pickle.dump(tokenized_test, f)
+    return tokenized_test
+
+def get_test_dataloader(teacher_tokenizer, student_tokenizer):
+    raw_dataset = load_devign_data(config.dataset_name, config.data_cache_dir)
+    teacher_test = preprocess_dataset_for_model(raw_dataset, teacher_tokenizer, config.data_cache_dir, "teacher")
+    teacher_test_dataset = CodeBERT_DevignDataset(teacher_test)
+    teacher_data_collator = DataCollatorWithPadding(tokenizer=teacher_tokenizer, padding="max_length", max_length=config.max_length)
+    teacher_dataloader = DataLoader(
+        teacher_test_dataset, batch_size=config.eval_batch_size, collate_fn=teacher_data_collator,
+        shuffle=False, pin_memory=True
+    )
+    student_test = preprocess_dataset_for_model(raw_dataset, student_tokenizer, config.data_cache_dir, "student")
+    student_test_dataset = CodeBERT_DevignDataset(student_test)
+    student_data_collator = DataCollatorWithPadding(tokenizer=student_tokenizer, padding="max_length", max_length=config.max_length)
+    student_dataloader = DataLoader(
+        student_test_dataset, batch_size=config.eval_batch_size, collate_fn=student_data_collator,
+        shuffle=False, pin_memory=True
+    )
+    true_labels = np.array([sample["labels"] for sample in student_test])
+    return teacher_dataloader, student_dataloader, true_labels
+
+def load_teacher_model():
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.teacher_base_model_path, device_map="auto", trust_remote_code=True,
+        torch_dtype=torch.float16, low_cpu_mem_usage=True, attn_implementation="flash_attention_2"
+    )
+    base_model.gradient_checkpointing_enable()
+    base_model.config.use_cache = False
+    model_with_head = Qwen2CoderForVulnerabilityDetection(
+        base_model=base_model, num_labels=config.num_labels
+    )
+    lora_config = LoraConfig.from_pretrained(config.teacher_checkpoint_dir)
+    teacher_model = PeftModel.from_pretrained(model_with_head, config.teacher_checkpoint_dir, config=lora_config)
+    peft_state_dict = teacher_model.state_dict()
+    target_prefixes = ["base_model.model.classifier.", "classifier.", "base_model.classifier."]
+    classifier_loaded = False
+    required_keys = set(teacher_model.classifier.state_dict().keys())
+    for prefix in target_prefixes:
+        classifier_params = {k.replace(prefix, ""): v for k, v in peft_state_dict.items() if k.startswith(prefix)}
+        if classifier_params and set(classifier_params.keys()) == required_keys:
+            teacher_model.classifier.load_state_dict(classifier_params)
+            classifier_loaded = True
+            break
+    if not classifier_loaded:
+        raise ValueError("教师模型分类头权重加载失败！")
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+    teacher_model.eval()
+    return teacher_model
+
+def load_distilled_student_model():
+    student_tokenizer = RobertaTokenizer.from_pretrained(config.codebert_model_path)
+    if student_tokenizer.pad_token is None:
+        student_tokenizer.pad_token = student_tokenizer.eos_token
+    
+    config_path = os.path.join(config.distilled_student_dir, "config.json")
+    if os.path.exists(config_path):
+        student_config = RobertaConfig.from_pretrained(config_path)
+    else:
+        student_config = RobertaConfig.from_pretrained(config.codebert_model_path)
+    student_config.num_labels = config.num_labels
+    student_config.dropout = config.dropout_probability
+    
+    try:
+        student_model = AutoModelForSequenceClassification.from_pretrained(
+            config.distilled_student_dir, 
+            config=student_config, 
+            ignore_mismatched_sizes=True
+        ).to(config.device)
+    except:
+        student_model = RobertaForSequenceClassification.from_pretrained(
+            config.codebert_model_path,
+            config=student_config,
+            ignore_mismatched_sizes=True
+        ).to(config.device)
+        weight_path = os.path.join(config.distilled_student_dir, "pytorch_model.bin")
+        if not os.path.exists(weight_path):
+            weight_path = os.path.join(config.distilled_student_dir, "model.bin")
+        if os.path.exists(weight_path):
+            state_dict = torch.load(weight_path, map_location=config.device, weights_only=True)
+            student_model.load_state_dict(state_dict, strict=False)
+    
+    student_model.eval()
+    return student_model, student_tokenizer
+
+def load_finetuned_student_model():
+    tokenizer = RobertaTokenizer.from_pretrained(config.codebert_model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    config_path = os.path.join(config.finetuned_student_dir, "checkpoint-best-f1", "config.json")
+    if not os.path.exists(config_path):
+        config_path = os.path.join(config.finetuned_student_dir, "config.json")
+    finetune_config = RobertaConfig.from_pretrained(config_path)
+    finetune_config.num_labels = 1
+    finetune_config.dropout = config.dropout_probability
+
+    encoder = RobertaForSequenceClassification.from_pretrained(
+        config.codebert_model_path, config=finetune_config, ignore_mismatched_sizes=True
+    )
+
+    args = type('Args', (), {'dropout_probability': config.dropout_probability})()
+    finetuned_model = Model(encoder, finetune_config, tokenizer, args)
+
+    model_weight_path = os.path.join(config.finetuned_student_dir, "checkpoint-best-f1", "model.bin")
+    if not os.path.exists(model_weight_path):
+        raise FileNotFoundError(f"FT（微调）模型权重文件不存在: {model_weight_path}")
+    state_dict = torch.load(model_weight_path, map_location=config.device, weights_only=True)
+    finetuned_model.load_state_dict(state_dict, strict=False)
+
+    finetuned_model = finetuned_model.to(config.device)
+    finetuned_model.eval()
+    return finetuned_model, tokenizer
+
+def load_pkd_student_model():
+    student_tokenizer = RobertaTokenizer.from_pretrained(config.codebert_model_path)
+    if student_tokenizer.pad_token is None:
+        student_tokenizer.pad_token = student_tokenizer.eos_token
+
+    base_model = AutoModel.from_pretrained(
+        config.codebert_model_path,
+        torch_dtype=torch.float32,
+        device_map="auto"
+    )
+
+    class PKDStudentInfer(torch.nn.Module):
+        def __init__(self, base_model, num_labels=2):
+            super().__init__()
+            self.base_model = base_model
+            self.student_hidden_size = base_model.config.hidden_size
+            self.num_labels = num_labels
+            
+            self.dropout = torch.nn.Dropout(0.1)
+            self.classifier = torch.nn.Linear(self.student_hidden_size, num_labels)
+
+        def forward(self, input_ids, attention_mask=None):
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            student_last_feat = outputs.hidden_states[-1]
+            mask = attention_mask.unsqueeze(-1).expand(student_last_feat.size()).float()
+            mask_sum = torch.clamp(mask.sum(dim=1), min=1e-4)
+            pooled_output = torch.sum(student_last_feat * mask, dim=1) / mask_sum
+            
+            pooled_output = self.dropout(pooled_output)
+            logits = self.classifier(pooled_output)
+            return logits
+
+    student_model = PKDStudentInfer(base_model, num_labels=2)
+
+    safe_paths = [
+        os.path.join(config.pkd_student_dir, "model.safetensors"),
+        os.path.join(config.pkd_student_dir, "pytorch_model.safetensors")
+    ]
+    weight_path = None
+    for path in safe_paths:
+        if os.path.exists(path):
+            weight_path = path
+            break
+    if weight_path is None:
+        raise FileNotFoundError(
+            f"没找到PKD的safetensors文件！检查目录：{config.pkd_student_dir}"
+        )
+    
+    state_dict = safetensors.torch.load_file(weight_path, device="cuda:0")
+    student_model.load_state_dict(state_dict, strict=False)
+    
+    student_model = student_model.to(config.device)
+    student_model.eval()
+    
+    return student_model, student_tokenizer
+
+def model_infer(model, dataloader, is_teacher=False, is_finetuned=False):
+    model.eval()
+    all_logits = []
+    all_labels = []
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    
+    for batch in tqdm(dataloader):
+        try:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch.get("attention_mask", input_ids.ne(1)).to(device)
+            labels = batch.get("labels", torch.tensor([])).cpu().numpy()
+        except (KeyError, TypeError):
+            try:
+                input_ids = batch[0].to(device)
+                attention_mask = input_ids.ne(1).to(device)
+                labels = batch[1].cpu().numpy()
+            except:
+                raise
+        
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        }
+        
+        if len(labels) > 0:
+            all_labels.append(labels)
+        
+        with torch.no_grad():
+            if is_teacher:
+                outputs = model(** inputs)
+                
+                if isinstance(outputs, torch.Tensor):
+                    logits = outputs.float().cpu().numpy()
+                elif isinstance(outputs, dict):
+                    logits = outputs["logits"].float().cpu().numpy()
+                elif hasattr(outputs, 'logits'):
+                    logits = outputs.logits.float().cpu().numpy()
+                elif isinstance(outputs, (tuple, list)):
+                    logits = outputs[-1].float().cpu().numpy()
+                else:
+                    logits = torch.tensor(outputs).float().cpu().numpy()
+                
+                all_logits.append(logits)
+            else:
+                if is_finetuned:
+                    outputs = model(input_ids=input_ids)
+                    probs = outputs.float().cpu().numpy()
+                    all_logits.append(probs)
+                else:
+                    outputs = model(** inputs)
+                    
+                    if isinstance(outputs, torch.Tensor):
+                        logits = outputs.float().cpu().numpy()
+                    else:
+                        logits = outputs.logits.float().cpu().numpy()
+                    
+                    all_logits.append(logits)
+
+    if len(all_logits) == 0:
+        return None, None, None
+    
+    all_logits = np.concatenate(all_logits, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0) if len(all_labels) > 0 else np.array([])
+    
+    if is_finetuned:
+        probs = all_logits[:, 0] if len(all_logits.shape) > 1 else all_logits
+        preds = (probs > 0.5).astype(int)
+    else:
+        if len(all_logits.shape) == 1:
+            all_logits = all_logits.reshape(-1, 2)
+        all_logits = all_logits - np.max(all_logits, axis=-1, keepdims=True)
+        probs = np.exp(all_logits) / np.sum(np.exp(all_logits), axis=-1, keepdims=True)
+        probs = probs[:, 1]
+        preds = (probs > 0.5).astype(int)
+    
+    return all_logits, probs, preds
+
+def calculate_agreement(teacher_pred_labels, student_pred_labels, student_type):
+    agreement = (teacher_pred_labels == student_pred_labels).mean() * 100
+    agreement = float(round(agreement, 4))
+    return agreement
+
+def calculate_gt_nll_error(teacher_probs, student_probs, true_labels, student_type):
+    gt_nll_error = []
+    for t_p, s_p, label in zip(teacher_probs, student_probs, true_labels):
+        p_C_t = t_p if label == 1 else (1 - t_p)
+        p_C_s = s_p if label == 1 else (1 - s_p)
+        p_C_t = np.clip(p_C_t, config.EPS, 1 - config.EPS)
+        p_C_s = np.clip(p_C_s, config.EPS, 1 - config.EPS)
+        nll_t = -np.log(p_C_t)
+        nll_s = -np.log(p_C_s)
+        error = np.abs(nll_s - nll_t)
+        gt_nll_error.append(error)
+    gt_nll_error = np.array(gt_nll_error)
+    mean_err = float(np.nanmean(gt_nll_error))
+    std_err = float(np.nanstd(gt_nll_error))
+    return gt_nll_error
+
+def plot_error_distribution_comparison(
+    distilled_gt_nll, finetuned_gt_nll, pkd_gt_nll,
+    subplot_name="subplot.pdf"
+):
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    plt.rcParams['figure.dpi'] = 300
+    plt.rcParams['savefig.dpi'] = 300
+    plt.rcParams['lines.linewidth'] = 2.5
+    plt.rcParams['font.size'] = 12
+
+    color_ft = '#E63946'
+    color_kd = '#2E86AB'
+    color_pkd = '#4CAF50'
+    alpha_fill = 0.3
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5.8))
+    
+    distilled_gt_nll = np.clip(distilled_gt_nll, config.EPS, None)
+    finetuned_gt_nll = np.clip(finetuned_gt_nll, config.EPS, None)
+    pkd_gt_nll = np.clip(pkd_gt_nll, config.EPS, None)
+
+    sns.kdeplot(finetuned_gt_nll, ax=ax, color=color_ft, fill=True, alpha=alpha_fill,
+                label=f'FT (Mean={finetuned_gt_nll.mean():.4f})')
+    sns.kdeplot(distilled_gt_nll, ax=ax, color=color_kd, fill=True, alpha=alpha_fill,
+                label=f'VKD (Mean={distilled_gt_nll.mean():.4f})')
+    sns.kdeplot(pkd_gt_nll, ax=ax, color=color_pkd, fill=True, alpha=alpha_fill,
+                label=f'PKD (Mean={pkd_gt_nll.mean():.4f})')
+
+    ax.axvline(finetuned_gt_nll.mean(), color=color_ft, linestyle='--', linewidth=2, alpha=0.8)
+    ax.axvline(distilled_gt_nll.mean(), color=color_kd, linestyle='--', linewidth=2, alpha=0.8)
+    ax.axvline(pkd_gt_nll.mean(), color=color_pkd, linestyle='--', linewidth=2, alpha=0.8)
+
+    x_min = 0
+    x_max = 2.0
+    ax.set_xlim(x_min, x_max)
+    ax.set_xticks([0.0, 0.4, 0.8, 1.2, 1.6, 2.0])
+
+    ax.set_xlabel(r'$\Delta$(NLL)', fontsize=20, fontweight='bold')
+    ax.set_ylabel('Density', fontsize=20, fontweight='bold')
+    ax.tick_params(axis='both', labelsize=18)
+    ax.legend(loc='upper right', fontsize=20, frameon=False)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout(pad=0.3)
+    save_path = os.path.join(config.vis_save_dir, subplot_name)
+    plt.savefig(save_path, dpi=300, facecolor='white', bbox_inches='tight')
+    plt.close()
+
+def save_comparison_results(metrics_distilled, metrics_finetuned, metrics_pkd,
+                           distilled_gt_nll, finetuned_gt_nll, pkd_gt_nll):
+    def process_np_type(x):
+        if isinstance(x, np.ndarray):
+            return float(np.nanmean(x)) if len(x) > 0 else 0.0
+        elif isinstance(x, (np.float32, np.float64, np.int64, np.int32)):
+            return float(x) if isinstance(x, (np.float32, np.float64)) else int(x)
+        elif np.isnan(x) or np.isinf(x):
+            return 0.0
+        else:
+            return x
+
+    comparison_results = {
+        "数据集信息": {
+            "测试集样本数": process_np_type(metrics_distilled["total_test_samples"]),
+            "教师模型": "CodeLlama (LoRA微调，代码专用大模型)",
+            "FT（微调）学生模型": f"CodeBERT-base（{config.finetuned_student_dir.split('/')[-1]}）",
+            "KD（蒸馏）学生模型": config.distilled_student_dir.split("/")[-1],
+            "PKD（逐层蒸馏）学生模型": config.pkd_student_dir.split("/")[-1],
+            "任务": "Devign漏洞检测（论文defect detection任务）"
+        },
+        "一致性指标对比（论文Table5核心）": {
+            "预测一致性Agreement(%)": {
+                "FT（微调）": process_np_type(metrics_finetuned["agreement(%)"]),
+                "KD（蒸馏）": process_np_type(metrics_distilled["agreement(%)"]),
+                "PKD（逐层蒸馏）": process_np_type(metrics_pkd["agreement(%)"])
+            }
+        },
+        "对齐误差指标对比（论文6.3节核心）": {
+            "GT NLL误差（均值±标准差）": {
+                "FT（微调）": f"{process_np_type(finetuned_gt_nll.mean()):.4f} ± {process_np_type(finetuned_gt_nll.std()):.4f}",
+                "KD（蒸馏）": f"{process_np_type(distilled_gt_nll.mean()):.4f} ± {process_np_type(distilled_gt_nll.std()):.4f}",
+                "PKD（逐层蒸馏）": f"{process_np_type(pkd_gt_nll.mean()):.4f} ± {process_np_type(pkd_gt_nll.std()):.4f}"
+            }
+        }
+    }
+
+    json_path = os.path.join(config.result_save_dir, 'agreement_comparison_results_FT_KD_PKD.json')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(comparison_results, f, indent=4, ensure_ascii=False)
+
+    txt_path = os.path.join(config.result_save_dir, 'agreement_comparison_summary_FT_KD_PKD.txt')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write("="*120 + "\n")
+        f.write("Devign漏洞检测 - 师生模型一致性对比结果（FT vs KD vs PKD）\n")
+        f.write("="*120 + "\n\n")
+        f.write("一、实验配置\n")
+        for k, v in comparison_results["数据集信息"].items():
+            f.write(f"  {k:25s}: {v}\n")
+        f.write("\n二、一致性指标对比（论文Table5核心，单位：%）\n")
+        f.write(f"{'指标':<30s} {'FT（微调）':<15s} {'KD（蒸馏）':<15s} {'PKD（逐层蒸馏）':<15s}\n")
+        f.write("-"*70 + "\n")
+        for metric, data in comparison_results["一致性指标对比（论文Table5核心）"].items():
+            f.write(f"{metric:<30s} {data['FT（微调）']:<15.4f} {data['KD（蒸馏）']:<15.4f} {data['PKD（逐层蒸馏）']:<15.4f}\n")
+        f.write("\n三、对齐误差指标对比（论文6.3节核心，越小越好）\n")
+        f.write(f"{'指标':<35s} {'FT（微调）':<20s} {'KD（蒸馏）':<20s} {'PKD（逐层蒸馏）':<20s}\n")
+        f.write("-"*90 + "\n")
+        for metric, data in comparison_results["对齐误差指标对比（论文6.3节核心）"].items():
+            f.write(f"{metric:<35s} {data['FT（微调）']:<20s} {data['KD（蒸馏）']:<20s} {data['PKD（逐层蒸馏）']:<20s}\n")
+        f.write("\n" + "="*120 + "\n")
+
+def main():
+    teacher_tokenizer = AutoTokenizer.from_pretrained(config.teacher_base_model_path, trust_remote_code=True, padding_side="right")
+    if teacher_tokenizer.pad_token is None:
+        teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+    finetuned_model, finetuned_tokenizer = load_finetuned_student_model()
+    distilled_model, distilled_tokenizer = load_distilled_student_model()
+    pkd_model, pkd_tokenizer = load_pkd_student_model()
+
+    teacher_model = load_teacher_model()
+
+    teacher_dataloader, student_dataloader, true_labels = get_test_dataloader(teacher_tokenizer, finetuned_tokenizer)
+
+    _, teacher_probs, teacher_pred_labels = model_infer(teacher_model, teacher_dataloader, is_teacher=True)
+    _, finetuned_probs, finetuned_pred_labels = model_infer(
+        finetuned_model, student_dataloader, is_teacher=False, is_finetuned=True
+    )
+    _, distilled_probs, distilled_pred_labels = model_infer(
+        distilled_model, student_dataloader, is_teacher=False, is_finetuned=False
+    )
+    _, pkd_probs, pkd_pred_labels = model_infer(
+        pkd_model, student_dataloader, is_teacher=False, is_finetuned=False
+    )
+
+    finetuned_agreement = calculate_agreement(teacher_pred_labels, finetuned_pred_labels, "FT（微调）(CodeBERT-base)")
+    finetuned_gt_nll = calculate_gt_nll_error(teacher_probs, finetuned_probs, true_labels, "FT（微调）(CodeBERT-base)")
+    distilled_agreement = calculate_agreement(teacher_pred_labels, distilled_pred_labels, "KD（蒸馏）")
+    distilled_gt_nll = calculate_gt_nll_error(teacher_probs, distilled_probs, true_labels, "KD（蒸馏）")
+    pkd_agreement = calculate_agreement(teacher_pred_labels, pkd_pred_labels, "PKD（逐层蒸馏）")
+    pkd_gt_nll = calculate_gt_nll_error(teacher_probs, pkd_probs, true_labels, "PKD（逐层蒸馏）")
+
+    metrics_finetuned = {
+        "total_test_samples": int(len(true_labels)),
+        "agreement(%)": finetuned_agreement
+    }
+    metrics_distilled = {
+        "total_test_samples": int(len(true_labels)),
+        "agreement(%)": distilled_agreement
+    }
+    metrics_pkd = {
+        "total_test_samples": int(len(true_labels)),
+        "agreement(%)": pkd_agreement
+    }
+
+    plot_error_distribution_comparison(
+        distilled_gt_nll, finetuned_gt_nll, pkd_gt_nll
+    )                          
+
+    save_comparison_results(
+        metrics_distilled, metrics_finetuned, metrics_pkd,
+        distilled_gt_nll, finetuned_gt_nll, pkd_gt_nll
+    )
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        raise
+    finally:
+        import_utils.check_torch_load_is_safe = original_check
+        modeling_utils.check_torch_load_is_safe = original_load_check
