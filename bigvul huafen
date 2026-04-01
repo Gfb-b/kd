@@ -1,0 +1,133 @@
+import os
+import logging
+import hashlib
+from datasets import load_dataset  # 用于加载本地CSV文件
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger()
+
+
+def get_code_hash(code):
+    """计算代码内容的MD5哈希（唯一标识，忽略首尾空格）"""
+    if not isinstance(code, str):
+        code = str(code)  # 处理非字符串格式的代码
+    cleaned_code = code.strip()  # 去除首尾空格（避免微小格式差异）
+    if not cleaned_code:
+        return "empty_code"  # 空代码的特殊标识
+    return hashlib.md5(cleaned_code.encode("utf-8")).hexdigest()
+
+
+def check_local_dataset_overlap(train_path, val_path, test_path):
+    """验证本地划分的训练集/验证集/测试集的重合度"""
+    # 检查文件是否存在
+    for path in [train_path, val_path, test_path]:
+        if not os.path.exists(path):
+            logger.error(f"错误：文件不存在！路径：{path}")
+            return
+
+    # 加载本地CSV文件（通过datasets库的csv加载器）
+    logger.info("开始加载本地划分的数据集...")
+    try:
+        # 用字典指定各划分对应的文件路径
+        dataset = load_dataset(
+            "csv",
+            data_files={
+                "train": train_path,
+                "validation": val_path,
+                "test": test_path
+            }
+        )
+        logger.info(f"数据集加载完成，包含划分: {list(dataset.keys())}")
+    except Exception as e:
+        logger.error(f"数据集加载失败: {str(e)}", exc_info=True)
+        return
+
+    # 检查是否包含必要的字段（func_before是代码内容，必须存在）
+    required_columns = ["func_before"]
+    for split in dataset:
+        missing_cols = [col for col in required_columns if col not in dataset[split].column_names]
+        if missing_cols:
+            logger.error(f"{split}集缺少必要字段: {missing_cols}，无法检测重合度")
+            return
+
+    # 提取各划分的代码哈希（作为唯一标识）
+    logger.info("正在计算各样本的代码哈希（用于检测重复内容）...")
+    split_hashes = {}  # 存储每个划分的哈希表：{split: {hash: 样本索引}}
+
+    for split in ["train", "validation", "test"]:
+        hashes = {}
+        for idx, sample in enumerate(dataset[split]):
+            code = sample["func_before"]  # 代码内容字段
+            h = get_code_hash(code)
+            hashes[h] = idx  # 哈希映射到样本索引
+        split_hashes[split] = hashes
+        logger.info(f"  {split}集处理完成，共{len(hashes)}个样本")
+
+    # 计算不同划分之间的重合哈希（相同代码内容）
+    train_hashes = split_hashes["train"]
+    val_hashes = split_hashes["validation"]
+    test_hashes = split_hashes["test"]
+
+    train_val_overlap = set(train_hashes.keys()) & set(val_hashes.keys())
+    train_test_overlap = set(train_hashes.keys()) & set(test_hashes.keys())
+    val_test_overlap = set(val_hashes.keys()) & set(test_hashes.keys())
+
+    # 整理重合样本的索引信息（便于定位）
+    def format_overlap(overlap_hashes, hash1, split1, hash2, split2):
+        """格式化重合样本信息：(split1[索引], split2[索引], 哈希)"""
+        return [
+            (f"{split1}[{hash1[h]}]", f"{split2}[{hash2[h]}]", h)
+            for h in overlap_hashes
+        ]
+
+    train_val_details = format_overlap(train_val_overlap, train_hashes, "train", val_hashes, "validation")
+    train_test_details = format_overlap(train_test_overlap, train_hashes, "train", test_hashes, "test")
+    val_test_details = format_overlap(val_test_overlap, val_hashes, "validation", test_hashes, "test")
+
+    # 输出检测结果
+    logger.info("\n" + "=" * 80)
+    logger.info(f"本地划分数据集重合度检测结果（基于代码内容哈希）")
+    logger.info("=" * 80)
+    logger.info(f"训练集样本数: {len(train_hashes)}")
+    logger.info(f"验证集样本数: {len(val_hashes)}")
+    logger.info(f"测试集样本数: {len(test_hashes)}")
+    logger.info("-" * 80)
+    logger.info(f"训练集 ↔ 验证集 重合样本数: {len(train_val_details)}")
+    logger.info(f"训练集 ↔ 测试集 重合样本数: {len(train_test_details)}")
+    logger.info(f"验证集 ↔ 测试集 重合样本数: {len(val_test_details)}")
+    logger.info("-" * 80)
+
+    # 打印重合样本示例（最多前5个，避免输出过长）
+    if train_test_details:
+        logger.error("❌ 严重数据泄露：训练集与测试集存在完全相同的代码样本！")
+        logger.error("  重合样本示例（划分[索引] → 哈希）:")
+        for item in train_test_details[:5]:
+            logger.error(f"    {item[0]} ↔ {item[1]} | 哈希: {item[2]}")
+
+    elif train_val_details:
+        logger.warning("⚠️ 数据泄露：训练集与验证集存在完全相同的代码样本！")
+        logger.warning("  重合样本示例（划分[索引] → 哈希）:")
+        for item in train_val_details[:5]:
+            logger.warning(f"    {item[0]} ↔ {item[1]} | 哈希: {item[2]}")
+
+    else:
+        logger.info("✅ 无数据泄露：三个划分的代码样本完全不重复")
+
+    logger.info("=" * 80)
+
+    return {
+        "train_val": len(train_val_details),
+        "train_test": len(train_test_details),
+        "val_test": len(val_test_details)
+    }
+
+
+if __name__ == "__main__":
+    # 请修改为你的本地划分数据集路径
+    TRAIN_PATH = "E:/bigvul_train.csv"    # 训练集路径
+    VAL_PATH = "E:/bigvul_val.csv"        # 验证集路径
+    TEST_PATH = "E:/bigvul_test.csv"      # 测试集路径
+
+    # 执行检测
+    check_local_dataset_overlap(TRAIN_PATH, VAL_PATH, TEST_PATH)
