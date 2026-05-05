@@ -1,0 +1,581 @@
+import torch
+import math
+import numpy as np
+import random
+import os
+import pickle
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer,
+    TrainingArguments, Trainer, set_seed,
+    AutoModel, EvalPrediction
+)
+from peft import PeftModel, LoraConfig, get_peft_model
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import torch.nn.functional as F
+FIXED_SEED = 42
+
+
+def set_all_seeds(seed=FIXED_SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    set_seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+set_all_seeds()
+
+TEACHER_CHECKPOINT_DIR = "autodl-tmp/checkpoint-3600"
+TEACHER_BASE_MODEL_PATH = "autodl-tmp/codellma"
+TEACHER_TOKENIZER_PATH = "autodl-tmp/codellma"
+STUDENT_MODEL_PATH = "autodl-tmp/contrabert"
+STUDENT_TOKENIZER_PATH = "autodl-tmp/contrabert"
+
+DATASET_NAME = "DetectVul/devign"
+MAX_SEQ_LENGTH = 256
+NUM_LABELS = 2
+DATA_CACHE_DIR = os.path.join("codebert3-pkfd-r2vl", "dataset_cache")
+MAX_CHECKPOINTS = 1
+
+PKD_ALPHA = 0.7
+PKD_BETA = 3
+PKD_T = 3.0
+PKD_IGNORE_LAST_LAYER = True
+PKD_TOP_N_LAYERS = 11
+PKD_OUTPUT_DIR_BASE = "autodl-tmp/codebert3-pfkd-re4v"
+OUTPUT_DIR_BASE = PKD_OUTPUT_DIR_BASE
+
+BATCH_SIZE = 8
+NUM_EPOCHS = 5
+GRADIENT_ACCUMULATION_STEPS = 4
+LEARNING_RATE = 2e-5
+
+teacher_tokenizer = AutoTokenizer.from_pretrained(
+    TEACHER_TOKENIZER_PATH,
+    trust_remote_code=True,
+    padding_side="right",
+    add_prefix_space=False
+)
+if teacher_tokenizer.pad_token is None:
+    teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+
+student_tokenizer = AutoTokenizer.from_pretrained(
+    STUDENT_TOKENIZER_PATH,
+    padding_side="right",
+    add_prefix_space=False
+)
+
+
+class StarCoderForPKD(torch.nn.Module):
+    def __init__(self, base_model, num_labels=2):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.base_model = base_model.to(self.device)
+        self.config = base_model.config
+        self.config.num_labels = num_labels
+        self.hidden_size = self.config.hidden_size
+        self.num_layers = self.config.num_hidden_layers
+
+        self.classifier = torch.nn.Linear(self.hidden_size, num_labels).to(self.device, dtype=torch.float32)
+        self.dropout = torch.nn.Dropout(0.1).to(self.device)
+        torch.nn.init.normal_(self.classifier.weight, std=0.02)
+        if self.classifier.bias is not None:
+            torch.nn.init.zeros_(self.classifier.bias)
+
+    def l2_normalize(self, x, eps=1e-8):
+        return x / (torch.norm(x, dim=-1, keepdim=True) + eps)
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        with torch.no_grad():
+            if input_ids is None:
+                batch_size = 0 if attention_mask is None else attention_mask.shape[0]
+                empty_feat = torch.zeros((self.num_layers - 1, batch_size, self.hidden_size), dtype=torch.float32).to(
+                    self.device)
+                empty_logits = torch.zeros((batch_size, NUM_LABELS), dtype=torch.float32).to(self.device)
+                return empty_feat, empty_logits
+
+            input_ids = input_ids.to(self.device)
+            attention_mask = attention_mask.to(self.device) if attention_mask is not None else None
+
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False
+            )
+            all_hidden = outputs.hidden_states
+            transformer_feat = torch.stack([h.float() for h in all_hidden[1:]], dim=0)
+
+            transformer_feat_cls = transformer_feat[:, :, 0, :]
+            transformer_feat_cls = transformer_feat_cls[:-1, :, :]
+            normed_feat = self.l2_normalize(transformer_feat_cls)
+
+            last_layer_feat = all_hidden[-2].float()
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1).expand(last_layer_feat.size()).float()
+                mask_sum = torch.clamp(mask.sum(dim=1), min=1e-4)
+                pooled_output = torch.sum(last_layer_feat * mask, dim=1) / mask_sum
+            else:
+                pooled_output = torch.mean(last_layer_feat, dim=1)
+            pooled_output = self.dropout(pooled_output)
+            teacher_logits = self.classifier(pooled_output)
+        return normed_feat, teacher_logits
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_model, name)
+
+
+def load_teacher_model():
+    base_model = AutoModelForCausalLM.from_pretrained(
+        TEACHER_BASE_MODEL_PATH,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        attn_implementation="flash_attention_2"
+    )
+    base_model.gradient_checkpointing_enable()
+    base_model.config.use_cache = False
+
+    model_with_head = StarCoderForPKD(
+        base_model=base_model,
+        num_labels=NUM_LABELS
+    )
+
+    lora_config = LoraConfig.from_pretrained(TEACHER_CHECKPOINT_DIR)
+    teacher_model = PeftModel.from_pretrained(
+        model_with_head,
+        TEACHER_CHECKPOINT_DIR,
+        config=lora_config
+    )
+
+    peft_state_dict = teacher_model.state_dict()
+    target_prefixes = ["base_model.model.classifier.", "classifier.", "base_model.classifier."]
+    classifier_loaded = False
+    required_keys = set(teacher_model.classifier.state_dict().keys())
+
+    for prefix in target_prefixes:
+        classifier_params = {
+            k.replace(prefix, ""): v for k, v in peft_state_dict.items() if k.startswith(prefix)
+        }
+        if classifier_params and set(classifier_params.keys()) == required_keys:
+            teacher_model.classifier.load_state_dict(classifier_params)
+            classifier_loaded = True
+            break
+
+    if not classifier_loaded:
+        raise ValueError("教师模型分类头权重加载失败！请检查Checkpoint路径")
+
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+    teacher_model.eval()
+    return teacher_model
+
+
+teacher_model = load_teacher_model()
+TEACHER_NUM_LAYERS = teacher_model.num_layers - 1
+TEACHER_HIDDEN_SIZE = teacher_model.hidden_size
+
+
+class CodeBERTForPKD(torch.nn.Module):
+    def __init__(self, model_path, teacher_num_layers, teacher_hidden_size, num_labels=NUM_LABELS):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.base_model = AutoModel.from_pretrained(
+            model_path,
+            device_map="auto",
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
+        )
+
+        self.student_config = self.base_model.config
+        self.student_num_layers = self.student_config.num_hidden_layers
+        self.student_hidden_size = self.student_config.hidden_size
+        self.teacher_num_layers = teacher_num_layers
+        self.teacher_hidden_size = teacher_hidden_size
+        self.num_labels = num_labels
+        self.pkd_ignore_last = PKD_IGNORE_LAST_LAYER
+        self.pkd_top_n = PKD_TOP_N_LAYERS
+
+        assert 1 <= self.pkd_top_n <= self.student_num_layers
+        self.layer_scale_e = self.teacher_num_layers / self.student_num_layers
+
+        self.dropout = torch.nn.Dropout(0.1).to(self.device)
+        self.classifier = torch.nn.Linear(self.student_hidden_size, num_labels).to(self.device, dtype=torch.float32)
+        torch.nn.init.normal_(self.classifier.weight, std=0.02)
+        if self.classifier.bias is not None:
+            torch.nn.init.zeros_(self.classifier.bias)
+
+        self.projection = None
+        if self.student_hidden_size != self.teacher_hidden_size:
+            self.projection = torch.nn.Linear(
+                in_features=self.teacher_hidden_size,
+                out_features=self.student_hidden_size
+            ).to(self.device, dtype=torch.float32)
+
+    def l2_normalize(self, x, eps=1e-8):
+        return x / (torch.norm(x, dim=-1, keepdim=True) + eps)
+
+    def get_layer_mapping(self):
+        start_idx = self.student_num_layers - self.pkd_top_n
+        student_top_layers = list(range(start_idx, self.student_num_layers))
+        if self.pkd_ignore_last:
+            student_top_layers = student_top_layers[:-1]
+
+        layer_mapping = {}
+        for s_k in student_top_layers:
+            t_k = math.floor(self.layer_scale_e * s_k)
+            t_k = max(0, min(t_k, self.teacher_num_layers - 1))
+            layer_mapping[s_k] = t_k
+
+        unique_mapping = {}
+        used_t_layers = set()
+        for s_k in sorted(layer_mapping.keys()):
+            t_k = layer_mapping[s_k]
+            if t_k not in used_t_layers:
+                unique_mapping[s_k] = t_k
+                used_t_layers.add(t_k)
+
+        return unique_mapping
+
+    def vanilla_kd_loss(self, student_logits, teacher_logits, T):
+        student_soft = F.log_softmax(student_logits / T, dim=-1)
+        teacher_soft = F.softmax(teacher_logits / T, dim=-1)
+        kd_loss = F.kl_div(student_soft, teacher_soft, reduction="batchmean")
+        return kd_loss
+
+    def forward(self, student_input_ids, student_attention_mask=None, labels=None,
+                teacher_input_ids=None, teacher_attention_mask=None):
+        student_outputs = self.base_model(
+            input_ids=student_input_ids,
+            attention_mask=student_attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        all_hidden = student_outputs.hidden_states
+        student_all_feat = torch.stack([h for h in all_hidden[1:]], dim=0)
+
+        student_all_feat_cls = student_all_feat[:, :, 0, :]
+        student_all_feat = self.l2_normalize(student_all_feat_cls)
+
+        student_last_feat = all_hidden[-2]
+        if student_attention_mask is not None:
+            mask = student_attention_mask.unsqueeze(-1).expand(student_last_feat.size()).float()
+            mask_sum = torch.clamp(mask.sum(dim=1), min=1e-4)
+            pooled_output = torch.sum(student_last_feat * mask, dim=1) / mask_sum
+        else:
+            pooled_output = torch.mean(student_last_feat, dim=1)
+        pooled_output = self.dropout(pooled_output)
+        student_logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            labels = labels.to(student_logits.device)
+            if teacher_input_ids is None or teacher_attention_mask is None:
+                cls_loss = F.cross_entropy(student_logits.view(-1, self.num_labels), labels.view(-1))
+                loss = cls_loss
+            else:
+                teacher_all_feat, teacher_logits = teacher_model(
+                    input_ids=teacher_input_ids,
+                    attention_mask=teacher_attention_mask
+                )
+                teacher_all_feat = teacher_all_feat.to(self.device, dtype=torch.float32)
+                teacher_logits = teacher_logits.to(self.device, dtype=torch.float32)
+
+                if self.projection is not None:
+                    teacher_all_feat = self.projection(teacher_all_feat)
+                    teacher_all_feat = self.l2_normalize(teacher_all_feat)
+
+                cls_loss = F.cross_entropy(student_logits.view(-1, self.num_labels), labels.view(-1))
+                kd_loss = self.vanilla_kd_loss(student_logits, teacher_logits, PKD_T)
+                layer_mapping = self.get_layer_mapping()
+                layer_mse_loss = 0.0
+                if len(layer_mapping) > 0:
+                    for s_k, t_k in layer_mapping.items():
+                        s_feat = student_all_feat[s_k]
+                        t_feat = teacher_all_feat[t_k]
+                        feat_diff = s_feat - t_feat
+                        l2_norm_sq = torch.norm(feat_diff, p=2, dim=-1) ** 2
+                        layer_mse_loss += l2_norm_sq.sum()
+
+                loss = (1 - PKD_ALPHA) * cls_loss + PKD_ALPHA * kd_loss * PKD_T * PKD_T + PKD_BETA * layer_mse_loss
+
+        return {"loss": loss, "logits": student_logits}
+
+
+student_model = CodeBERTForPKD(
+    model_path=STUDENT_MODEL_PATH,
+    teacher_num_layers=TEACHER_NUM_LAYERS,
+    teacher_hidden_size=TEACHER_HIDDEN_SIZE
+)
+
+
+def load_and_preprocess_data(force_reload=False):
+    os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+    cache_files = {
+        "tokenized_train": os.path.join(DATA_CACHE_DIR, "tokenized_train.pkl"),
+        "tokenized_val": os.path.join(DATA_CACHE_DIR, "tokenized_val.pkl"),
+        "tokenized_test": os.path.join(DATA_CACHE_DIR, "tokenized_test.pkl")
+    }
+
+    if not force_reload and all(os.path.exists(f) for f in cache_files.values()):
+        with open(cache_files["tokenized_train"], "rb") as f:
+            tokenized_train = pickle.load(f)
+        with open(cache_files["tokenized_val"], "rb") as f:
+            tokenized_val = pickle.load(f)
+        with open(cache_files["tokenized_test"], "rb") as f:
+            tokenized_test = pickle.load(f)
+        data_collator = DualTokenizerDataCollator(teacher_tokenizer, student_tokenizer)
+        return tokenized_train, tokenized_val, tokenized_test, data_collator
+
+    dataset = load_dataset(DATASET_NAME)
+
+    def preprocess_function(examples):
+        code_field = "func_clean"
+        if code_field not in examples:
+            raise ValueError(f"数据集缺失 {code_field} 字段！")
+        texts = examples[code_field]
+
+        teacher_tokenized = teacher_tokenizer(
+            texts, truncation=True, max_length=MAX_SEQ_LENGTH, padding=False, return_attention_mask=True
+        )
+        student_tokenized = student_tokenizer(
+            texts, truncation=True, max_length=MAX_SEQ_LENGTH, padding=False, return_attention_mask=True
+        )
+        labels = examples["target"]
+        if isinstance(labels[0], bool):
+            labels = [1 if label else 0 for label in labels]
+
+        return {
+            "teacher_input_ids": teacher_tokenized["input_ids"],
+            "teacher_attention_mask": teacher_tokenized["attention_mask"],
+            "student_input_ids": student_tokenized["input_ids"],
+            "student_attention_mask": student_tokenized["attention_mask"],
+            "labels": labels
+        }
+
+    tokenized_train = dataset["train"].map(
+        preprocess_function, batched=True, remove_columns=dataset["train"].column_names
+    )
+    tokenized_val = dataset["validation"].map(
+        preprocess_function, batched=True, remove_columns=dataset["validation"].column_names
+    )
+    tokenized_test = dataset["test"].map(
+        preprocess_function, batched=True, remove_columns=dataset["test"].column_names
+    )
+
+    with open(cache_files["tokenized_train"], "wb") as f:
+        pickle.dump(tokenized_train, f)
+    with open(cache_files["tokenized_val"], "wb") as f:
+        pickle.dump(tokenized_val, f)
+    with open(cache_files["tokenized_test"], "wb") as f:
+        pickle.dump(tokenized_test, f)
+
+    data_collator = DualTokenizerDataCollator(teacher_tokenizer, student_tokenizer)
+    return tokenized_train, tokenized_val, tokenized_test, data_collator
+
+
+class DualTokenizerDataCollator:
+    def __init__(self, teacher_tokenizer, student_tokenizer):
+        self.teacher_tokenizer = teacher_tokenizer
+        self.student_tokenizer = student_tokenizer
+        self.teacher_pad_id = teacher_tokenizer.pad_token_id
+        self.student_pad_id = student_tokenizer.pad_token_id
+        self.max_length = MAX_SEQ_LENGTH
+
+    def __call__(self, features):
+        teacher_input_ids = [f["teacher_input_ids"] for f in features]
+        teacher_attention_masks = [f["teacher_attention_mask"] for f in features]
+        padded_teacher_ids, padded_teacher_masks = self._pad_single_tokenizer(
+            teacher_input_ids, teacher_attention_masks, self.teacher_pad_id
+        )
+
+        student_input_ids = [f["student_input_ids"] for f in features]
+        student_attention_masks = [f["student_attention_mask"] for f in features]
+        padded_student_ids, padded_student_masks = self._pad_single_tokenizer(
+            student_input_ids, student_attention_masks, self.student_pad_id
+        )
+
+        labels = [f["labels"] for f in features]
+
+        return {
+            "teacher_input_ids": torch.tensor(padded_teacher_ids, dtype=torch.long),
+            "teacher_attention_mask": torch.tensor(padded_teacher_masks, dtype=torch.long),
+            "student_input_ids": torch.tensor(padded_student_ids, dtype=torch.long),
+            "student_attention_mask": torch.tensor(padded_student_masks, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long)
+        }
+
+    def _pad_single_tokenizer(self, input_ids_list, attention_masks_list, pad_id):
+        padded_ids = []
+        padded_masks = []
+        for ids, mask in zip(input_ids_list, attention_masks_list):
+            if len(ids) < self.max_length:
+                padded_id = ids + [pad_id] * (self.max_length - len(ids))
+                padded_mask = mask + [0] * (self.max_length - len(mask))
+            else:
+                padded_id = ids[:self.max_length]
+                padded_mask = mask[:self.max_length]
+            padded_ids.append(padded_id)
+            padded_masks.append(padded_mask)
+        return padded_ids, padded_masks
+
+
+tokenized_train, tokenized_val, tokenized_test, data_collator = load_and_preprocess_data()
+
+
+def compute_metrics(eval_pred: EvalPrediction):
+    predictions = eval_pred.predictions
+    labels = eval_pred.label_ids
+
+    if isinstance(predictions, list):
+        predictions = np.concatenate([p for p in predictions if p is not None], axis=0)
+    elif isinstance(predictions, torch.Tensor):
+        predictions = predictions.cpu().numpy()
+    if isinstance(labels, list):
+        labels = np.concatenate([l for l in labels if l is not None], axis=0)
+    elif isinstance(labels, torch.Tensor):
+        labels = labels.cpu().numpy()
+
+    if len(predictions.shape) != 2:
+        predictions = predictions.reshape(-1, NUM_LABELS)
+    labels = labels.reshape(-1)
+
+    preds = np.argmax(predictions, axis=1)
+    accuracy = accuracy_score(labels, preds)
+    precision_bin, recall_bin, f1_bin, _ = precision_recall_fscore_support(
+        labels, preds, average="binary", zero_division=0
+    )
+    precision_per_cls, recall_per_cls, f1_per_cls, _ = precision_recall_fscore_support(
+        labels, preds, average=None, zero_division=0
+    )
+
+    non_defective_f1 = f1_per_cls[0]
+    defective_f1 = f1_per_cls[1]
+    if non_defective_f1 == 0.0:
+        defective_f1 = -1.0
+
+    metrics = {
+        "accuracy": accuracy,
+        "precision": precision_bin,
+        "recall": recall_bin,
+        "f1": f1_bin,
+        "defective_precision": precision_per_cls[1],
+        "defective_recall": recall_per_cls[1],
+        "defective_f1": defective_f1,
+        "non_defective_precision": precision_per_cls[0],
+        "non_defective_recall": recall_per_cls[0],
+        "non_defective_f1": non_defective_f1,
+    }
+    return metrics
+
+
+def train_pkd():
+    training_args = TrainingArguments(
+        output_dir=f"{OUTPUT_DIR_BASE}/pkd-training",
+        learning_rate=LEARNING_RATE,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=16,
+        num_train_epochs=NUM_EPOCHS,
+        logging_dir=f"{OUTPUT_DIR_BASE}/pkd-logs",
+        logging_steps=50,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="defective_f1",
+        greater_is_better=True,
+        report_to="none",
+        fp16=False,
+        fp16_full_eval=False,
+        remove_unused_columns=False,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        warmup_steps=0,
+        lr_scheduler_type="linear",
+        seed=FIXED_SEED,
+        max_grad_norm=1.0,
+        save_total_limit=MAX_CHECKPOINTS,
+        gradient_checkpointing=False,
+        logging_first_step=True,
+        log_level="info"
+    )
+
+    class PKDTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            outputs = model(**inputs)
+            loss = outputs["loss"]
+            return (loss, outputs) if return_outputs else loss
+
+        def prediction_step(
+                self,
+                model,
+                inputs,
+                prediction_loss_only: bool,
+                ignore_keys=None,
+        ):
+            student_inputs = {k: v for k, v in inputs.items() if not k.startswith("teacher_")}
+            with torch.no_grad():
+                outputs = model(**student_inputs)
+
+            loss = outputs["loss"].detach() if outputs["loss"] is not None else None
+            logits = outputs["logits"].detach()
+            labels = inputs.get("labels").detach() if inputs.get("labels") is not None else None
+
+            if prediction_loss_only:
+                return (loss, None, None)
+            else:
+                return (loss, logits, labels)
+
+        def _prepare_optimizer_and_scheduler(self, num_training_steps: int):
+            super()._prepare_optimizer_and_scheduler(num_training_steps)
+            if hasattr(self, 'scaler') and self.scaler is not None:
+                self.scaler = None
+
+    trainer = PKDTrainer(
+        model=student_model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+
+    trainer.train()
+
+    all_eval_results = trainer.state.log_history
+    valid_eval_results = []
+    for log in all_eval_results:
+        if "eval_non_defective_f1" in log and log["eval_non_defective_f1"] != 0.0:
+            valid_eval_results.append(log)
+
+    if not valid_eval_results:
+        return
+    else:
+        best_result = max(valid_eval_results, key=lambda x: x.get("eval_defective_f1", -1))
+        best_epoch = best_result.get("epoch", "unknown")
+
+        best_model_dir = f"{OUTPUT_DIR_BASE}/best-pkd-student-model"
+        trainer.save_model(best_model_dir)
+        student_tokenizer.save_pretrained(best_model_dir)
+
+    test_results = trainer.evaluate(eval_dataset=tokenized_test)
+
+    with open(f"{OUTPUT_DIR_BASE}/pkd_test_results.txt", "w") as f:
+        for key, value in test_results.items():
+            f.write(f"{key}: {value:.4f}\n" if isinstance(value, float) else f"{key}: {value}\n")
+
+
+if __name__ == "__main__":
+    os.makedirs(OUTPUT_DIR_BASE, exist_ok=True)
+    train_pkd()
+
+    import_utils.check_torch_load_is_safe = original_check
+    modeling_utils.check_torch_load_is_safe = original_load_check
