@@ -1,0 +1,690 @@
+import os
+import torch
+import json
+import shutil
+import random
+import numpy as np
+import pickle
+import datetime
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from torch.nn import functional as F
+import torch.nn as nn
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+    AutoConfig,
+    get_linear_schedule_with_warmup,
+    set_seed,
+    RobertaConfig,
+    RobertaModel,
+)
+from peft import PeftModel, LoraConfig
+import logging
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from datasets import load_dataset
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import PreTrainedTokenizerFast
+
+def setup_logging():
+    logger = logging.getLogger()
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    file_handler = logging.FileHandler("run.log")
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+logger = setup_logging()
+
+FIXED_SEED = 42
+set_seed(FIXED_SEED)
+random.seed(FIXED_SEED)
+np.random.seed(FIXED_SEED)
+torch.manual_seed(FIXED_SEED)
+torch.cuda.manual_seed_all(FIXED_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"{device} {torch.cuda.is_available()}")
+logger.info(f"{torch.__version__}")
+
+VOCAB_SIZE = 2000
+MAX_LENGTH = 512
+TOKENIZER_PATH = "autodl-tmp/zcustom_tokenizer"
+os.makedirs(TOKENIZER_PATH, exist_ok=True)
+
+ROBERTA_7M_CONFIG = RobertaConfig(
+    vocab_size=VOCAB_SIZE,
+    hidden_size=192,
+    num_hidden_layers=3,
+    num_attention_heads=3,
+    intermediate_size=384,
+    hidden_act="gelu",
+    max_position_embeddings=MAX_LENGTH + 1,
+    type_vocab_size=1,
+    hidden_dropout_prob=0.1,
+    attention_probs_dropout_prob=0.1,
+    num_labels=2,
+    pad_token_id=0,
+)
+
+class VulRoBERTa7M(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.roberta = RobertaModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        cls_emb = outputs.last_hidden_state[:, 0, :]
+        logits = self.classifier(self.dropout(cls_emb))
+        loss = nn.CrossEntropyLoss()(logits, labels) if labels is not None else None
+        return {"loss": loss, "logits": logits} if loss else {"logits": logits}
+
+def get_custom_tokenizer():
+    tokenizer_file = os.path.join(TOKENIZER_PATH, "tokenizer.json")
+    if os.path.exists(tokenizer_file):
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
+        tokenizer.pad_token = "<pad>"
+        tokenizer.unk_token = "<unk>"
+        return tokenizer
+
+    dataset = load_dataset("DetectVul/devign")
+    tokenizer = Tokenizer(BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = Whitespace()
+    trainer = BpeTrainer(vocab_size=VOCAB_SIZE, special_tokens=["<pad>", "<unk>", "<cls>", "<sep>", "<mask>"])
+    def batch_iterator():
+        for i in range(0, len(dataset["train"]), 1000):
+            yield dataset["train"][i:i+1000]["func_clean"]
+    tokenizer.train_from_iterator(batch_iterator(), trainer=trainer)
+    tokenizer.save(tokenizer_file)
+
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
+    tokenizer.pad_token = "<pad>"
+    tokenizer.unk_token = "<unk>"
+    return tokenizer
+
+class Config:
+    def __init__(self):
+        self.teacher_checkpoint_dir = "autodl-tmp/starcoder devign/best-model"
+        self.teacher_base_model_path = "autodl-tmp/starcoder"
+        self.model_path = "autodl-tmp/graphcodebert"
+        self.output_dir = "autodl-tmp/qweng12a"
+        self.best_model_dir = os.path.join(self.output_dir, "best_model")
+        self.num_labels = 2
+        self.distill_temperature = 3.0
+        self.alpha = 0.7
+        self.logits_storage_dir = "qwenlogit"
+        self.eval_steps = 100
+        self.save_steps = 100
+        self.max_checkpoints = 2
+        self.resume_from_checkpoint = None
+        self.early_stopping_patience = 0
+        self.early_stopping_threshold = 1e-5
+        self.learning_rate = 1e-4
+        self.epochs = 5
+        self.warmup_steps = 0
+        self.batch_size = 16
+        self.eval_batch_size = 16
+        self.logging_steps = 50
+        self.save_strategy = "epoch"
+        self.eval_strategy = "epoch"
+        self.max_grad_norm = 1.0
+        self.gradient_accumulation_steps = 4
+        self.adam_eps = 1e-8
+        self.adam_beta1 = 0.9
+        self.adam_beta2 = 0.999
+        self.improvement_threshold = 0.001
+        self.dataset_name = "DetectVul/devign"
+        self.teacher_data_cache_dir = "qwendev"
+        self.student_data_cache_dir = "autodl-tmp/zstu6e1"
+        self.max_length = MAX_LENGTH
+        self.train_shuffle = False
+        self.val_shuffle = False
+        self.test_shuffle = False
+
+class CodeBERT_DevignDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+        logger.info(f"{len(self.data)}")
+        if len(self.data) > 0:
+            sample_keys = self.data[0].keys()
+            required_keys = {"input_ids", "attention_mask", "labels"}
+            missing_keys = required_keys - sample_keys
+            if missing_keys:
+                logger.warning(f"{missing_keys}")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        return {
+            "input_ids": torch.tensor(sample["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(sample["attention_mask"], dtype=torch.long),
+            "labels": torch.tensor(sample["labels"], dtype=torch.long)
+        }
+
+class LogitsDataset(Dataset):
+    def __init__(self, student_dataset, logits, indices):
+        self.student_dataset = student_dataset
+        self.logits = np.asarray(logits, dtype=np.float32)
+        self.indices_map = {idx: i for i, idx in enumerate(indices)}
+
+        if len(self.indices_map) != len(self.logits):
+            raise ValueError(f"{len(self.indices_map)} {len(self.logits)}")
+        if self.logits.ndim != 2 or self.logits.shape[1] != 2:
+            raise ValueError(f"{self.logits.shape}")
+
+        logger.info(f"{len(student_dataset)} {self.logits.shape}")
+
+    def __len__(self):
+        return len(self.student_dataset)
+
+    def __getitem__(self, idx):
+        student_item = self.student_dataset[idx]
+        logits_idx = self.indices_map[idx]
+        teacher_logits = self.logits[logits_idx].flatten()
+
+        return {
+            "input_ids": student_item["input_ids"],
+            "attention_mask": student_item["attention_mask"],
+            "labels": student_item["labels"],
+            "teacher_logits": teacher_logits
+        }
+
+def load_devign_data(dataset_name, cache_dir):
+    logger.info(f"{dataset_name}")
+    try:
+        if os.path.exists(os.path.join(cache_dir, "dataset_info.json")):
+            logger.info(f"{cache_dir}")
+            dataset = load_dataset(cache_dir=cache_dir)
+        else:
+            dataset = load_dataset(dataset_name)
+            dataset.save_to_disk(cache_dir)
+
+        msg = ""
+        for split in dataset.keys():
+            s = len(dataset[split])
+            c = sum(1 for x in dataset[split] if x["target"])
+            msg += f"{split} {s} {c} {s-c}\n"
+        logger.info(msg.strip())
+        return dataset
+    except Exception as e:
+        logger.error(f"{str(e)}", exc_info=True)
+        raise
+
+def preprocess_dataset_for_model(dataset, tokenizer, cache_dir, model_type):
+    cache_files = {
+        "train": os.path.join(cache_dir, f"{model_type}_tokenized_train.pkl"),
+        "val": os.path.join(cache_dir, f"{model_type}_tokenized_val.pkl"),
+        "test": os.path.join(cache_dir, f"{model_type}_tokenized_test.pkl")
+    }
+
+    if all(os.path.exists(f) for f in cache_files.values()):
+        logger.info(f"{model_type}")
+        with open(cache_files["train"], "rb") as f:
+            tokenized_train = pickle.load(f)
+        with open(cache_files["val"], "rb") as f:
+            tokenized_val = pickle.load(f)
+        with open(cache_files["test"], "rb") as f:
+            tokenized_test = pickle.load(f)
+    else:
+        logger.info(f"{model_type}")
+
+        def f(n, d):
+            l = d["target"]
+            a = sum(l)
+            b = len(l)-a
+            logger.info(f"{model_type} {n} {a} {b} {a/len(l):.2%}")
+
+        f("train", dataset["train"])
+        f("val", dataset["validation"])
+        f("test", dataset["test"])
+
+        def pf(examples):
+            code = examples["func_clean"]
+            t = tokenizer(
+                code,
+                truncation=True,
+                max_length=config.max_length,
+                padding=False,
+                return_tensors=None,
+                add_special_tokens=True
+            )
+            l = examples["target"]
+            if isinstance(l[0], bool):
+                l = [1 if x else 0 for x in l]
+            t["labels"] = l
+            return t
+
+        st = dataset["train"].shuffle(seed=FIXED_SEED)
+        tokenized_train = st.map(pf, batched=True, remove_columns=dataset["train"].column_names)
+        tokenized_val = dataset["validation"].map(pf, batched=True, remove_columns=dataset["validation"].column_names)
+        tokenized_test = dataset["test"].map(pf, batched=True, remove_columns=dataset["test"].column_names)
+
+        with open(cache_files["train"], "wb") as f:
+            pickle.dump(tokenized_train, f)
+        with open(cache_files["val"], "wb") as f:
+            pickle.dump(tokenized_val, f)
+        with open(cache_files["test"], "wb") as f:
+            pickle.dump(tokenized_test, f)
+
+    logger.info(f"{tokenized_train.column_names}")
+    logger.info(f"{tokenized_val.column_names}")
+    logger.info(f"{tokenized_test.column_names}")
+    return tokenized_train, tokenized_val, tokenized_test
+
+class Qwen2CoderForVulnerabilityDetection(torch.nn.Module):
+    def __init__(self, base_model, num_labels=2, class_weights=None):
+        super().__init__()
+        self.base_model = base_model.to(device)
+        self.config = base_model.config
+        self.config.num_labels = num_labels
+        self.class_weights = class_weights.half() if class_weights is not None else None
+        self.hidden_size = self.config.hidden_size
+        self.classifier = torch.nn.Linear(self.hidden_size, num_labels).to(device, dtype=torch.float16)
+        self.dropout = torch.nn.Dropout(0.1).to(device)
+        torch.nn.init.normal_(self.classifier.weight, std=0.02)
+        if self.classifier.bias is not None:
+            torch.nn.init.zeros_(self.classifier.bias)
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        input_ids = input_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True, use_cache=False)
+        lhs = outputs.hidden_states[-1]
+
+        if attention_mask is not None:
+            m = attention_mask.unsqueeze(-1).expand(lhs.size()).half()
+            po = torch.sum(lhs * m, dim=1) / torch.clamp(m.sum(dim=1), min=1e-9)
+        else:
+            po = torch.mean(lhs, dim=1)
+
+        po = self.dropout(po)
+        logits = self.classifier(po)
+        return {"logits": logits}
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_model, name)
+
+def load_teacher_model(config):
+    logger.info(f"{config.teacher_checkpoint_dir}")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.teacher_base_model_path,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        attn_implementation="flash_attention_2"
+    )
+    base_model.gradient_checkpointing_enable()
+    base_model.config.use_cache = False
+
+    m = Qwen2CoderForVulnerabilityDetection(base_model=base_model, num_labels=config.num_labels)
+    lc = LoraConfig.from_pretrained(config.teacher_checkpoint_dir)
+    tm = PeftModel.from_pretrained(m, config.teacher_checkpoint_dir, config=lc)
+    
+    sd = tm.state_dict()
+    p = ["base_model.model.classifier.", "classifier.", "base_model.classifier."]
+    cl = False
+    rk = set(tm.classifier.state_dict().keys())
+
+    for x in p:
+        cp = {k.replace(x, ""): v for k, v in sd.items() if k.startswith(x)}
+        if cp and set(cp.keys()) == rk:
+            tm.classifier.load_state_dict(cp)
+            logger.info(f"{x}")
+            cl = True
+            break
+
+    if not cl:
+        raise ValueError()
+
+    for param in tm.parameters():
+        param.requires_grad = False
+    tm.eval()
+    return tm.to(device)
+
+def load_student_model(config):
+    try:
+        logger.info("1")
+        model = VulRoBERTa7M(ROBERTA_7M_CONFIG)
+        tp = sum(p.numel() for p in model.parameters())
+        tnp = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"{tp/1e6:.2f}M {tnp/1e6:.2f}M")
+        return model.to(device)
+    except Exception as e:
+        logger.error(f"{str(e)}", exc_info=True)
+        raise
+
+def generate_and_save_teacher_logits(teacher_model, dataset, tokenizer, config):
+    os.makedirs(config.logits_storage_dir, exist_ok=True)
+    lf = os.path.join(config.logits_storage_dir, "teacher_train_logits.pkl")
+    inf = os.path.join(config.logits_storage_dir, "logits_indices.pkl")
+
+    if os.path.exists(lf) and os.path.exists(inf):
+        logger.info(f"{config.logits_storage_dir}")
+        with open(lf, "rb") as f:
+            al = pickle.load(f)
+        with open(inf, "rb") as f:
+            idx = pickle.load(f)
+        return al, idx
+
+    logger.info(f"{config.logits_storage_dir}")
+    dc = DataCollatorWithPadding(tokenizer=tokenizer, padding="max_length", max_length=config.max_length)
+    dl = DataLoader(dataset, batch_size=config.batch_size, collate_fn=dc, shuffle=False, pin_memory=True)
+
+    al = []
+    idx = list(range(len(dataset)))
+    teacher_model.eval()
+
+    with torch.no_grad():
+        for step, batch in enumerate(dl):
+            i = {"input_ids": batch["input_ids"].to(device), "attention_mask": batch["attention_mask"].to(device)}
+            o = teacher_model(**i)
+            lg = o["logits"]
+
+            if len(lg.shape) != 2 or lg.shape[1] != config.num_labels:
+                logger.warning(f"{lg.shape}")
+                if len(lg.shape) == 1:
+                    lg = lg.unsqueeze(1)
+                if lg.shape[1] == 1 and config.num_labels == 2:
+                    lg = torch.cat([-lg, lg], dim=1)
+
+            al.append(lg.to(torch.float32).cpu().numpy())
+            if step % 10 == 0:
+                logger.info(f"{step}/{len(dl)}")
+
+    al = np.concatenate(al, axis=0)
+    logger.info(f"{al.shape}")
+
+    with open(lf, "wb") as f:
+        pickle.dump(al, f)
+    with open(inf, "wb") as f:
+        pickle.dump(idx, f)
+
+    logger.info(f"{len(al)}")
+    return al, idx
+
+def get_optimizer_params(model, config):
+    ogp = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": config.learning_rate, "weight_decay": 0.01}]
+    return ogp
+
+def manage_checkpoints(config, current_step, current_f1):
+    if not os.path.exists(config.output_dir):
+        logger.warning(f"{config.output_dir}")
+        return
+
+    ccd = os.path.join(config.output_dir, f"checkpoint-{current_step}")
+    if not os.path.exists(ccd):
+        logger.warning(f"{ccd}")
+        return
+
+    md = {"step": current_step,"f1_score": current_f1,"timestamp": str(datetime.datetime.now())}
+    mp = os.path.join(ccd, "metadata.json")
+    try:
+        with open(mp, "w") as f:
+            json.dump(md, f, indent=4)
+    except Exception as e:
+        logger.error(f"{e}")
+        return
+
+    ac = []
+    for dn in os.listdir(config.output_dir):
+        dp = os.path.join(config.output_dir, dn)
+        if os.path.isdir(dp) and dn.startswith("checkpoint-"):
+            try:
+                s = int(dn.split("-")[-1])
+                mp = os.path.join(dp, "metadata.json")
+                if os.path.exists(mp):
+                    with open(mp, "r") as f:
+                        m = json.load(f)
+                        f1 = m.get("f1_score", 0.0)
+                    ac.append((s, f1, dp, dn))
+                    logger.debug(f"{dn} {f1:.4f}")
+                else:
+                    ac.append((s, -1.0, dp, dn))
+            except Exception as e:
+                ac.append((0, -2.0, dp, dn))
+
+    logger.info(f"{len(ac)}")
+    ac.sort(key=lambda x: (x[1], x[0]), reverse=True)
+
+    if len(ac) > 0:
+        msg = ""
+        for i, (s, f1, _, dn) in enumerate(ac):
+            msg += f"{i+1} {dn} {f1:.4f} {s}\n"
+        logger.info(msg.strip())
+
+    if len(ac) > config.max_checkpoints:
+        td = ac[config.max_checkpoints:]
+        logger.info(f"{len(ac)} {config.max_checkpoints} {len(td)}")
+        for s, f1, dp, dn in td:
+            try:
+                shutil.rmtree(dp)
+                logger.info(f"{dn} {f1:.4f} {s}")
+            except Exception as e:
+                logger.error(f"{dn} {e}")
+    else:
+        logger.info(f"{len(ac)} {config.max_checkpoints}")
+
+def compute_evaluation_metrics(pred):
+    pl = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+    tl = pred.label_ids
+    pr = pl.argmax(axis=-1)
+    p, r, f, _ = precision_recall_fscore_support(tl, pr, average="binary", zero_division=0)
+    acc = accuracy_score(tl, pr)
+    pc = precision_recall_fscore_support(tl, pr, average=None, zero_division=0)
+    return {
+        "accuracy": round(acc, 4), "precision": round(p, 4), "recall": round(r, 4), "f1": round(f, 4),
+        "defective_precision": round(pc[0][1], 4), "defective_recall": round(pc[1][1], 4), "defective_f1": round(pc[2][1], 4),
+        "non_defective_precision": round(pc[0][0], 4), "non_defective_recall": round(pc[1][0], 4), "non_defective_f1": round(pc[2][0], 4)
+    }
+
+def log_full_metrics(metrics, split_name, step=None):
+    si = f" {step}" if step is not None else ""
+    logger.info(f"{split_name} {si}")
+    logger.info(f"{metrics['eval_accuracy']:.4f}")
+    logger.info(f"{metrics['eval_precision']:.4f}")
+    logger.info(f"{metrics['eval_recall']:.4f}")
+    logger.info(f"{metrics['eval_f1']:.4f}")
+
+def save_best_model(model, tokenizer, cm, bm, config, metrics, step=None):
+    si = f" {step}" if step is not None else ""
+    if cm - bm >= config.improvement_threshold:
+        log_full_metrics(metrics, "val", step)
+        logger.info(f"{si} {bm:.4f} {cm:.4f} {config.improvement_threshold}")
+        os.makedirs(config.best_model_dir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(config.best_model_dir, "pytorch_model.bin"))
+        tokenizer.save_pretrained(config.best_model_dir)
+        
+        d = {"best_overall_f1": cm, "full_metrics": metrics}
+        if step is not None:
+            d["best_step"] = step
+
+        with open(os.path.join(config.best_model_dir, "best_metric.json"), "w") as f:
+            json.dump(d, f, indent=4)
+
+        logger.info(f"{config.best_model_dir}")
+        return cm
+    else:
+        log_full_metrics(metrics, "val", step)
+        logger.info(f"{cm:.4f} {bm:.4f} {config.improvement_threshold}")
+        return bm
+
+def get_data_loader(dataset, batch_size, shuffle, collate_fn):
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, pin_memory=True)
+
+class LogitsDistillationTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        self.temperature = kwargs.pop("temperature", 3.0)
+        self.alpha = kwargs.pop("alpha", 0.7)
+        self.esp = kwargs.pop("early_stopping_patience", 0)
+        self.et = kwargs.pop("early_stopping_threshold", 1e-5)
+        self.bm = None
+        self.esc = 0
+        self.lem = None
+        super().__init__(*args, **kwargs)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        htl = "teacher_logits" in inputs
+        tlg = None
+        if htl:
+            tlg = inputs.pop("teacher_logits").to(device)
+
+        l = inputs.get("labels").to(device)
+        o = model(** inputs)
+        slg = o["logits"]
+        hl = F.cross_entropy(slg, l)
+
+        if htl and tlg is not None:
+            slp = F.log_softmax(slg / self.temperature, dim=1)
+            tp = F.softmax(tlg / self.temperature, dim=1)
+            kl = F.kl_div(slp, tp, reduction="batchmean") * (self.temperature **2)
+            total = (1 - self.alpha) * hl + self.alpha * kl
+            self.log({"train/hard_loss": hl.item()})
+            self.log({"train/kl_loss": kl.item()})
+        else:
+            total = hl
+            self.log({"eval/loss": hl.item()})
+        return (total, o) if return_outputs else total
+
+    def evaluation_loop(self, *args, **kwargs):
+        out = super().evaluation_loop(*args, **kwargs)
+        m = out.metrics
+        if m:
+            self.lem = m.copy()
+            mn = self.args.metric_for_best_model
+            if mn in m:
+                cm = m[mn]
+                if self.bm is None:
+                    self.bm = cm
+                    logger.info(f"{mn} {cm:.6f}")
+                else:
+                    imp = cm - self.bm
+                    if imp > self.et:
+                        self.bm = cm
+                        logger.info(f"{mn} {cm:.6f} {imp:.6f}")
+                    else:
+                        logger.info(f"{mn} {cm:.6f} {self.bm:.6f}")
+        return out
+
+    def _save_checkpoint(self, model, trial):
+        cs = self.state.global_step
+        super()._save_checkpoint(model, trial)
+        logger.info(f"{cs}")
+        cm = self.lem
+        if cm and isinstance(cm, dict) and len(cm) > 0:
+            rm = "eval_f1"
+            if rm in cm:
+                cf1 = cm[rm]
+                logger.info(f"{cs} {cf1:.4f}")
+                manage_checkpoints(config, cs, cf1)
+            else:
+                logger.warning(f"{rm} {list(cm.keys())}")
+        else:
+            logger.debug(f"{cs}")
+
+config = None
+
+def main():
+    global config
+    config = Config()
+    os.makedirs(config.output_dir, exist_ok=True)
+    os.makedirs(config.best_model_dir, exist_ok=True)
+    os.makedirs(config.teacher_data_cache_dir, exist_ok=True)
+    os.makedirs(config.student_data_cache_dir, exist_ok=True)
+    os.makedirs(config.logits_storage_dir, exist_ok=True)
+
+    logger.info("1")
+    logger.info(f"{config.teacher_base_model_path}")
+    tt = AutoTokenizer.from_pretrained(config.teacher_base_model_path, trust_remote_code=True, padding_side="right")
+    tt.pad_token = tt.eos_token
+    st = get_custom_tokenizer()
+    rd = load_devign_data(config.dataset_name, config.student_data_cache_dir)
+
+    ttr, tv, tte = preprocess_dataset_for_model(dataset=rd, tokenizer=tt, cache_dir=config.teacher_data_cache_dir, model_type="teacher")
+    str_, sv, ste = preprocess_dataset_for_model(dataset=rd, tokenizer=st, cache_dir=config.student_data_cache_dir, model_type="student")
+
+    str_ = CodeBERT_DevignDataset(str_)
+    sv = CodeBERT_DevignDataset(sv)
+    ste = CodeBERT_DevignDataset(ste)
+
+    tm = load_teacher_model(config)
+    tl, li = generate_and_save_teacher_logits(teacher_model=tm, dataset=ttr, tokenizer=tt, config=config)
+    ld = LogitsDataset(student_dataset=str_, logits=tl, indices=li)
+    dc = DataCollatorWithPadding(tokenizer=st)
+
+    m = load_student_model(config)
+    tts = (len(ld) // (config.batch_size * config.gradient_accumulation_steps)) * config.epochs
+    logger.info(f"{tts}")
+
+    ta = {
+        "output_dir": config.output_dir, "num_train_epochs": config.epochs,
+        "per_device_train_batch_size": config.batch_size, "per_device_eval_batch_size": config.eval_batch_size,
+        "learning_rate": config.learning_rate, "warmup_steps": config.warmup_steps,
+        "logging_steps": config.logging_steps, "eval_strategy": config.eval_strategy, 
+        "save_strategy": config.save_strategy,  "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_defective_f1", "greater_is_better": True,
+        "fp16": torch.cuda.is_available(), "max_grad_norm": config.max_grad_norm,
+        "report_to": "none", "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "remove_unused_columns": False
+    }
+    targs = TrainingArguments(**ta)
+    opt = AdamW(get_optimizer_params(m, config), eps=config.adam_eps, betas=(config.adam_beta1, config.adam_beta2))
+    sch = get_linear_schedule_with_warmup(opt, config.warmup_steps, tts)
+
+    trainer = LogitsDistillationTrainer(
+        model=m, args=targs, train_dataset=ld, eval_dataset=sv,
+        compute_metrics=compute_evaluation_metrics, data_collator=dc,
+        optimizers=(opt, sch), temperature=config.distill_temperature, alpha=config.alpha
+    )
+
+    logger.info("1")
+    trainer.train()
+    vr = trainer.evaluate(sv)
+    bof = save_best_model(m, st, vr["eval_f1"], 0.0, config, vr)
+    trainer.model = m
+    ter = trainer.evaluate(ste)
+    log_full_metrics(ter, "test")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"{str(e)}", exc_info=True)
+        raise
+    finally:
+        import_utils.check_torch_load_is_safe = original_check
+        modeling_utils.check_torch_load_is_safe = original_load_check
