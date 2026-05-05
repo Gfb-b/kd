@@ -1,0 +1,736 @@
+import os
+import torch
+import json
+import shutil
+import random
+import numpy as np
+import pickle
+import datetime
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from torch.nn import functional as F
+import torch.nn as nn
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+    AutoConfig,
+    get_linear_schedule_with_warmup,
+    set_seed
+)
+from peft import PeftModel, LoraConfig
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from datasets import load_dataset
+FIXED_SEED = 42
+set_seed(FIXED_SEED)
+random.seed(FIXED_SEED)
+np.random.seed(FIXED_SEED)
+torch.manual_seed(FIXED_SEED)
+torch.cuda.manual_seed_all(FIXED_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class Config:
+    def __init__(self):
+        self.teacher_checkpoint_dir = "autodl-tmp/qwen2-7b-reveal-no-quant/final-training/checkpoint-1700"
+        self.teacher_base_model_path = "autodl-tmp/qwen"
+        self.model_path = "graphcodebert"
+        self.output_dir = "autodl-tmp/codebert_qwen2_distilled"
+        self.best_model_dir = os.path.join(self.output_dir, "best_model")
+        self.num_labels = 2
+        self.distill_temperature = 3.0
+        self.alpha = 0.7
+        self.logits_storage_dir = "qwen2_teacher_logits"
+        self.eval_steps = 100
+        self.save_steps = 100
+        self.max_checkpoints = 2
+        self.resume_from_checkpoint = None
+        self.early_stopping_patience = 0
+        self.early_stopping_threshold = 1e-5
+        self.learning_rate = 2e-5
+        self.epochs = 5
+        self.warmup_steps = 0
+        self.batch_size = 16
+        self.eval_batch_size = 16
+        self.logging_steps = 50
+        self.save_strategy = "steps"
+        self.eval_strategy = "steps"
+        self.max_grad_norm = 1.0
+        self.gradient_accumulation_steps = 4
+        self.adam_eps = 1e-8
+        self.adam_beta1 = 0.9
+        self.adam_beta2 = 0.999
+        self.improvement_threshold = 0.001
+        self.dataset_name = "claudios/ReVeal"
+        self.teacher_data_cache_dir = "qwen2_teacher_dataset_cache"
+        self.student_data_cache_dir = "student_dataset_cache"
+        self.max_length = 512
+        self.train_shuffle = False
+        self.val_shuffle = False
+        self.test_shuffle = False
+
+class CodeBERT_DevignDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+        if len(self.data) > 0:
+            sample_keys = self.data[0].keys()
+            required_keys = {"input_ids", "attention_mask", "labels"}
+            missing_keys = required_keys - sample_keys
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        return {
+            "input_ids": torch.tensor(sample["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(sample["attention_mask"], dtype=torch.long),
+            "labels": torch.tensor(sample["labels"], dtype=torch.long)
+        }
+
+class LogitsDataset(Dataset):
+    def __init__(self, student_dataset, logits, indices):
+        self.student_dataset = student_dataset
+        self.logits = np.asarray(logits, dtype=np.float32)
+        self.indices_map = {idx: i for i, idx in enumerate(indices)}
+
+        if len(self.indices_map) != len(self.logits):
+            raise ValueError(f"索引数({len(self.indices_map)})与logits数({len(self.logits)})不匹配")
+        if self.logits.ndim != 2 or self.logits.shape[1] != 2:
+            raise ValueError(f"logits必须是形状为(N, 2)的数组，当前形状：{self.logits.shape}")
+
+    def __len__(self):
+        return len(self.student_dataset)
+
+    def __getitem__(self, idx):
+        student_item = self.student_dataset[idx]
+        logits_idx = self.indices_map[idx]
+        teacher_logits = self.logits[logits_idx].flatten()
+
+        return {
+            "input_ids": student_item["input_ids"],
+            "attention_mask": student_item["attention_mask"],
+            "labels": student_item["labels"],
+            "teacher_logits": teacher_logits
+        }
+
+def load_devign_data(dataset_name, cache_dir):
+    try:
+        if os.path.exists(os.path.join(cache_dir, "dataset_info.json")):
+            dataset = load_dataset(cache_dir=cache_dir)
+        else:
+            dataset = load_dataset(dataset_name)
+            dataset.save_to_disk(cache_dir)
+        return dataset
+    except Exception as e:
+        raise
+
+def preprocess_dataset_for_model(dataset, tokenizer, cache_dir, model_type):
+    cache_files = {
+        "train": os.path.join(cache_dir, f"{model_type}_tokenized_train.pkl"),
+        "val": os.path.join(cache_dir, f"{model_type}_tokenized_val.pkl"),
+        "test": os.path.join(cache_dir, f"{model_type}_tokenized_test.pkl")
+    }
+
+    if all(os.path.exists(f) for f in cache_files.values()):
+        with open(cache_files["train"], "rb") as f:
+            tokenized_train = pickle.load(f)
+        with open(cache_files["val"], "rb") as f:
+            tokenized_val = pickle.load(f)
+        with open(cache_files["test"], "rb") as f:
+            tokenized_test = pickle.load(f)
+    else:
+        def preprocess_func(examples):
+            code = examples["functionSource"]
+            tokenized = tokenizer(
+                code,
+                truncation=True,
+                max_length=config.max_length,
+                padding=False,
+                return_tensors=None,
+                add_special_tokens=True
+            )
+
+            labels = examples["label"]
+            if isinstance(labels[0], bool):
+                labels = [1 if label else 0 for label in labels]
+            tokenized["labels"] = labels
+            return tokenized
+
+        shuffled_train = dataset["train"].shuffle(seed=FIXED_SEED)
+
+        tokenized_train = shuffled_train.map(
+            preprocess_func,
+            batched=True,
+            remove_columns=dataset["train"].column_names
+        )
+        tokenized_val = dataset["validation"].map(
+            preprocess_func,
+            batched=True,
+            remove_columns=dataset["validation"].column_names
+        )
+        tokenized_test = dataset["test"].map(
+            preprocess_func,
+            batched=True,
+            remove_columns=dataset["test"].column_names
+        )
+
+        with open(cache_files["train"], "wb") as f:
+            pickle.dump(tokenized_train, f)
+        with open(cache_files["val"], "wb") as f:
+            pickle.dump(tokenized_val, f)
+        with open(cache_files["test"], "wb") as f:
+            pickle.dump(tokenized_test, f)
+
+    return tokenized_train, tokenized_val, tokenized_test
+
+class Qwen2CoderForVulnerabilityDetection(torch.nn.Module):
+    def __init__(self, base_model, num_labels=2, class_weights=None):
+        super().__init__()
+        self.base_model = base_model.to(device)
+        self.config = base_model.config
+        self.config.num_labels = num_labels
+        self.class_weights = class_weights.half() if class_weights is not None else None
+        self.hidden_size = self.config.hidden_size
+
+        self.classifier = torch.nn.Linear(self.hidden_size, num_labels).to(device, dtype=torch.float16)
+        self.dropout = torch.nn.Dropout(0.1).to(device)
+        torch.nn.init.normal_(self.classifier.weight, std=0.02)
+        if self.classifier.bias is not None:
+            torch.nn.init.zeros_(self.classifier.bias)
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        input_ids = input_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False
+        )
+        last_hidden_state = outputs.hidden_states[-1]
+
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).half()
+            pooled_output = torch.sum(last_hidden_state * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
+        else:
+            pooled_output = torch.mean(last_hidden_state, dim=1)
+
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+
+        return {"logits": logits}
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_model, name)
+
+def load_teacher_model(config):
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.teacher_base_model_path,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        attn_implementation="flash_attention_2"
+    )
+    base_model.gradient_checkpointing_enable()
+    base_model.config.use_cache = False
+
+    model_with_head = Qwen2CoderForVulnerabilityDetection(
+        base_model=base_model,
+        num_labels=config.num_labels
+    )
+
+    lora_config = LoraConfig.from_pretrained(config.teacher_checkpoint_dir)
+    teacher_model = PeftModel.from_pretrained(
+        model_with_head,
+        config.teacher_checkpoint_dir,
+        config=lora_config
+    )
+
+    peft_state_dict = teacher_model.state_dict()
+    target_prefixes = ["base_model.model.classifier.", "classifier.", "base_model.classifier."]
+    classifier_loaded = False
+    required_keys = set(teacher_model.classifier.state_dict().keys())
+
+    for prefix in target_prefixes:
+        classifier_params = {
+            k.replace(prefix, ""): v for k, v in peft_state_dict.items() if k.startswith(prefix)
+        }
+        if classifier_params and set(classifier_params.keys()) == required_keys:
+            teacher_model.classifier.load_state_dict(classifier_params)
+            classifier_loaded = True
+            break
+
+    if not classifier_loaded:
+        raise ValueError("教师模型分类头权重加载失败！")
+
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+    teacher_model.eval()
+    return teacher_model.to(device)
+
+def load_student_model(config):
+    try:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            config.model_path,
+            num_labels=config.num_labels,
+            ignore_mismatched_sizes=True,
+            from_tf=False
+        )
+        return model.to(device)
+    except Exception as e:
+        raise
+
+def generate_and_save_teacher_logits(teacher_model, dataset, tokenizer, config):
+    os.makedirs(config.logits_storage_dir, exist_ok=True)
+    logits_file = os.path.join(config.logits_storage_dir, "teacher_train_logits.pkl")
+    indices_file = os.path.join(config.logits_storage_dir, "logits_indices.pkl")
+
+    if os.path.exists(logits_file) and os.path.exists(indices_file):
+        with open(logits_file, "rb") as f:
+            all_logits = pickle.load(f)
+        with open(indices_file, "rb") as f:
+            indices = pickle.load(f)
+        return all_logits, indices
+
+    data_collator = DataCollatorWithPadding(
+        tokenizer=tokenizer,
+        padding="max_length",
+        max_length=config.max_length
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        collate_fn=data_collator,
+        shuffle=False,
+        pin_memory=True
+    )
+
+    all_logits = []
+    indices = list(range(len(dataset)))
+
+    teacher_model.eval()
+    with torch.no_grad():
+        for step, batch in enumerate(dataloader):
+            inputs = {
+                "input_ids": batch["input_ids"].to(device),
+                "attention_mask": batch["attention_mask"].to(device)
+            }
+
+            outputs = teacher_model(** inputs)
+            logits = outputs["logits"]
+
+            if len(logits.shape) != 2 or logits.shape[1] != config.num_labels:
+                if len(logits.shape) == 1:
+                    logits = logits.unsqueeze(1)
+                if logits.shape[1] == 1 and config.num_labels == 2:
+                    logits = torch.cat([-logits, logits], dim=1)
+
+            all_logits.append(logits.to(torch.float32).cpu().numpy())
+
+    all_logits = np.concatenate(all_logits, axis=0)
+
+    with open(logits_file, "wb") as f:
+        pickle.dump(all_logits, f)
+    with open(indices_file, "wb") as f:
+        pickle.dump(indices, f)
+
+    return all_logits, indices
+
+def get_optimizer_params(model, config):
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for p in model.parameters() if p.requires_grad],
+            "lr": config.learning_rate,
+            "weight_decay": 0.01
+        }
+    ]
+    return optimizer_grouped_parameters
+
+def manage_checkpoints(config, current_step, current_f1):
+    if not os.path.exists(config.output_dir):
+        return
+
+    current_checkpoint_dir = os.path.join(config.output_dir, f"checkpoint-{current_step}")
+    if not os.path.exists(current_checkpoint_dir):
+        return
+
+    meta_data = {
+        "step": current_step,
+        "f1_score": current_f1,
+        "timestamp": str(datetime.datetime.now())
+    }
+    meta_path = os.path.join(current_checkpoint_dir, "metadata.json")
+    try:
+        with open(meta_path, "w") as f:
+            json.dump(meta_data, f, indent=4)
+    except Exception as e:
+        return
+
+    all_checkpoints = []
+    for dir_name in os.listdir(config.output_dir):
+        dir_path = os.path.join(config.output_dir, dir_name)
+        if os.path.isdir(dir_path) and dir_name.startswith("checkpoint-"):
+            try:
+                step = int(dir_name.split("-")[-1])
+                meta_path = os.path.join(dir_path, "metadata.json")
+                if os.path.exists(meta_path):
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+                        f1 = meta.get("f1_score", 0.0)
+                    all_checkpoints.append((step, f1, dir_path, dir_name))
+                else:
+                    all_checkpoints.append((step, -1.0, dir_path, dir_name))
+            except Exception as e:
+                all_checkpoints.append((0, -2.0, dir_path, dir_name))
+
+    all_checkpoints.sort(key=lambda x: (x[1], x[0]), reverse=True)
+
+    if len(all_checkpoints) > config.max_checkpoints:
+        to_delete = all_checkpoints[config.max_checkpoints:]
+        for step, f1, dir_path, dir_name in to_delete:
+            try:
+                shutil.rmtree(dir_path)
+            except Exception as e:
+                pass
+
+def compute_evaluation_metrics(pred):
+    pred_logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+    true_labels = pred.label_ids
+    pred_labels = pred_logits.argmax(axis=-1)
+
+    precision, recall, overall_f1, _ = precision_recall_fscore_support(
+        true_labels, pred_labels, average="binary", zero_division=0
+    )
+    accuracy = accuracy_score(true_labels, pred_labels)
+
+    per_class = precision_recall_fscore_support(true_labels, pred_labels, average=None, zero_division=0)
+
+    return {
+        "accuracy": round(accuracy, 4),
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(overall_f1, 4),
+        "defective_precision": round(per_class[0][1], 4),
+        "defective_recall": round(per_class[1][1], 4),
+        "defective_f1": round(per_class[2][1], 4),
+        "non_defective_precision": round(per_class[0][0], 4),
+        "non_defective_recall": round(per_class[1][0], 4),
+        "non_defective_f1": round(per_class[2][0], 4)
+    }
+
+def save_best_model(model, tokenizer, current_metric, best_metric, config, metrics, step=None):
+    if current_metric - best_metric >= config.improvement_threshold:
+        if os.path.exists(config.best_model_dir):
+            shutil.rmtree(config.best_model_dir)
+
+        model.save_pretrained(
+            config.best_model_dir,
+            save_safetensors=True,
+            safe_serialization=True
+        )
+        tokenizer.save_pretrained(config.best_model_dir)
+
+        save_data = {
+            "best_overall_f1": current_metric,
+            "full_metrics": metrics
+        }
+        if step is not None:
+            save_data["best_step"] = step
+
+        with open(os.path.join(config.best_model_dir, "best_metric.json"), "w") as f:
+            json.dump(save_data, f, indent=4)
+
+        return current_metric
+    else:
+        return best_metric
+
+def get_data_loader(dataset, batch_size, shuffle, collate_fn):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
+
+class LogitsDistillationTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        self.temperature = kwargs.pop("temperature", 3.0)
+        self.alpha = kwargs.pop("alpha", 0.7)
+        self.early_stopping_patience = kwargs.pop("early_stopping_patience", 0)
+        self.early_stopping_threshold = kwargs.pop("early_stopping_threshold", 1e-5)
+        self.best_metric = None
+        self.early_stopping_counter = 0
+        self.last_eval_metrics = None
+
+        super().__init__(*args, **kwargs)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        has_teacher_logits = "teacher_logits" in inputs
+        teacher_logits = None
+        if has_teacher_logits:
+            teacher_logits = inputs.pop("teacher_logits").to(device)
+
+        labels = inputs.get("labels").to(device)
+        outputs = model(** inputs)
+        student_logits = outputs.logits
+
+        hard_loss = F.cross_entropy(student_logits, labels)
+
+        if has_teacher_logits and teacher_logits is not None:
+            student_log_prob = F.log_softmax(student_logits / self.temperature, dim=1)
+            teacher_prob = F.softmax(teacher_logits / self.temperature, dim=1)
+            kl_loss = F.kl_div(
+                student_log_prob, teacher_prob,
+                reduction="batchmean"
+            ) * (self.temperature **2)
+
+            total_loss = (1 - self.alpha) * hard_loss + self.alpha * kl_loss
+            self.log({"train/hard_loss": hard_loss.item()})
+            self.log({"train/kl_loss": kl_loss.item()})
+        else:
+            total_loss = hard_loss
+            self.log({"eval/loss": hard_loss.item()})
+
+        return (total_loss, outputs) if return_outputs else total_loss
+
+    def evaluation_loop(self, *args, **kwargs):
+        output = super().evaluation_loop(*args, **kwargs)
+        metrics = output.metrics
+        if metrics:
+            self.last_eval_metrics = metrics.copy()
+            metric_name = self.args.metric_for_best_model
+            if metric_name in metrics:
+                current_metric = metrics[metric_name]
+                if self.best_metric is None:
+                    self.best_metric = current_metric
+                else:
+                    improvement = current_metric - self.best_metric
+                    if improvement > self.early_stopping_threshold:
+                        self.best_metric = current_metric
+
+        return output
+
+    def _save_checkpoint(self, model, trial):
+        current_step = self.state.global_step
+        super()._save_checkpoint(model, trial)
+
+        checkpoint_metrics = self.last_eval_metrics
+        if checkpoint_metrics is not None and isinstance(checkpoint_metrics, dict) and len(checkpoint_metrics) > 0:
+            required_metric = "eval_f1"
+            if required_metric in checkpoint_metrics:
+                current_f1 = checkpoint_metrics[required_metric]
+                manage_checkpoints(config, current_step, current_f1)
+
+def main():
+    global config
+    config = Config()
+
+    os.makedirs(config.output_dir, exist_ok=True)
+    os.makedirs(config.best_model_dir, exist_ok=True)
+    os.makedirs(config.teacher_data_cache_dir, exist_ok=True)
+    os.makedirs(config.student_data_cache_dir, exist_ok=True)
+    os.makedirs(config.logits_storage_dir, exist_ok=True)
+
+    teacher_tokenizer = AutoTokenizer.from_pretrained(
+        config.teacher_base_model_path,
+        trust_remote_code=True,
+        padding_side="right"
+    )
+    if teacher_tokenizer.pad_token is None:
+        teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+
+    student_tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+    if student_tokenizer.pad_token is None:
+        student_tokenizer.pad_token = student_tokenizer.eos_token
+
+    raw_dataset = load_devign_data(config.dataset_name, config.student_data_cache_dir)
+
+    teacher_train, teacher_val, teacher_test = preprocess_dataset_for_model(
+        dataset=raw_dataset,
+        tokenizer=teacher_tokenizer,
+        cache_dir=config.teacher_data_cache_dir,
+        model_type="teacher"
+    )
+
+    student_train_base, student_val, student_test = preprocess_dataset_for_model(
+        dataset=raw_dataset,
+        tokenizer=student_tokenizer,
+        cache_dir=config.student_data_cache_dir,
+        model_type="student"
+    )
+
+    student_train_base = CodeBERT_DevignDataset(student_train_base)
+    student_val = CodeBERT_DevignDataset(student_val)
+    student_test = CodeBERT_DevignDataset(student_test)
+
+    teacher_model = load_teacher_model(config)
+    teacher_logits, logits_indices = generate_and_save_teacher_logits(
+        teacher_model=teacher_model,
+        dataset=teacher_train,
+        tokenizer=teacher_tokenizer,
+        config=config
+    )
+
+    logits_dataset = LogitsDataset(
+        student_dataset=student_train_base,
+        logits=teacher_logits,
+        indices=logits_indices
+    )
+
+    data_collator = DataCollatorWithPadding(tokenizer=student_tokenizer)
+
+    model = load_student_model(config)
+    total_train_steps = (len(logits_dataset) // (config.batch_size * config.gradient_accumulation_steps)) * config.epochs
+
+    training_args_kwargs = {
+        "output_dir": config.output_dir,
+        "num_train_epochs": config.epochs,
+        "per_device_train_batch_size": config.batch_size,
+        "per_device_eval_batch_size": config.eval_batch_size,
+        "learning_rate": config.learning_rate,
+        "warmup_steps": config.warmup_steps,
+        "logging_dir": os.path.join(config.output_dir, "logs"),
+        "logging_steps": config.logging_steps,
+        "eval_strategy": config.eval_strategy,
+        "eval_steps": config.eval_steps,
+        "save_strategy": config.save_strategy,
+        "save_steps": config.save_steps,
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_defective_f1",
+        "greater_is_better": True,
+        "fp16": torch.cuda.is_available(),
+        "max_grad_norm": config.max_grad_norm,
+        "report_to": "none",
+        "disable_tqdm": False,
+        "lr_scheduler_type": "linear",
+        "save_total_limit": None,
+        "save_safetensors": True,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "remove_unused_columns": False
+    }
+
+    import inspect
+    training_args_signature = inspect.signature(TrainingArguments.__init__)
+    if 'dispatch_batches' in training_args_signature.parameters:
+        training_args_kwargs['dispatch_batches'] = False
+
+    training_args = TrainingArguments(** training_args_kwargs)
+
+    optimizer_grouped_params = get_optimizer_params(model, config)
+    optimizer = AdamW(
+        optimizer_grouped_params,
+        eps=config.adam_eps,
+        betas=(config.adam_beta1, config.adam_beta2)
+    )
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=total_train_steps
+    )
+
+    trainer = LogitsDistillationTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=logits_dataset,
+        eval_dataset=student_val,
+        compute_metrics=compute_evaluation_metrics,
+        data_collator=data_collator,
+        optimizers=(optimizer, scheduler),
+        temperature=config.distill_temperature,
+        alpha=config.alpha,
+        early_stopping_patience=config.early_stopping_patience,
+        early_stopping_threshold=config.early_stopping_threshold
+    )
+
+    resume_kwargs = {}
+    best_overall_f1 = 0.0
+
+    best_metric_path = os.path.join(config.best_model_dir, "best_metric.json")
+    if os.path.exists(best_metric_path):
+        try:
+            with open(best_metric_path, "r") as f:
+                best_metric_data = json.load(f)
+                best_overall_f1 = best_metric_data.get("best_overall_f1", 0.0)
+        except Exception as e:
+            best_overall_f1 = 0.0
+
+    if config.resume_from_checkpoint and os.path.exists(config.resume_from_checkpoint):
+        has_safetensors = os.path.exists(os.path.join(config.resume_from_checkpoint, "model.safetensors"))
+        has_bin = os.path.exists(os.path.join(config.resume_from_checkpoint, "pytorch_model.bin"))
+
+        if has_safetensors or has_bin:
+            required_files = ["training_args.bin", "optimizer.pt"]
+            missing = [f for f in required_files if not os.path.exists(os.path.join(config.resume_from_checkpoint, f))]
+            if not missing:
+                resume_kwargs["resume_from_checkpoint"] = config.resume_from_checkpoint
+
+    try:
+        train_result = trainer.train(**resume_kwargs)
+    except Exception as e:
+        raise
+
+    val_results = trainer.evaluate(student_val)
+    cleaned_val_metrics = {k.replace("eval_", ""): v for k, v in val_results.items()}
+
+    best_overall_f1 = save_best_model(
+        model=model,
+        tokenizer=student_tokenizer,
+        current_metric=cleaned_val_metrics["f1"],
+        best_metric=best_overall_f1,
+        config=config,
+        metrics=cleaned_val_metrics
+    )
+
+    if os.path.exists(os.path.join(config.best_model_dir, "model.safetensors")):
+        best_model = AutoModelForSequenceClassification.from_pretrained(
+            config.best_model_dir,
+            num_labels=config.num_labels,
+            from_tf=False
+        ).to(device)
+    elif os.path.exists(os.path.join(config.best_model_dir, "pytorch_model.bin")):
+        best_model = AutoModelForSequenceClassification.from_pretrained(
+            config.best_model_dir,
+            num_labels=config.num_labels,
+            from_tf=False
+        ).to(device)
+    else:
+        best_model = model
+
+    trainer.model = best_model
+    test_results = trainer.evaluate(student_test)
+    cleaned_test_metrics = {k.replace("eval_", ""): v for k, v in test_results.items()}
+
+    with open(os.path.join(config.best_model_dir, "test_results.json"), "w") as f:
+        json.dump(cleaned_test_metrics, f, indent=4)
+
+if __name__ == "__main__":
+    try:
+        import safetensors
+    except ImportError:
+        import subprocess
+        import sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "safetensors"])
+        import safetensors
+
+    try:
+        main()
+    except Exception as e:
+        raise
+    finally:
+        import_utils.check_torch_load_is_safe = original_check
+        modeling_utils.check_torch_load_is_safe = original_load_check
